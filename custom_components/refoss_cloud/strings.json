@@ -1,0 +1,44 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Refoss Cloud",
+        "description": "Enter your Refoss account credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "device": {
+        "title": "Refoss Cloud device",
+        "description": "Choose the EM06 device and billing cycle settings.",
+        "data": {
+          "uuid": "Device",
+          "name": "Name",
+          "reading_day": "Meter reading day",
+          "channels": "Channels (A1/B1/C1/A2/B2/C2)",
+          "scan_interval": "MQTT update interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect or log in to Refoss Cloud.",
+      "invalid_channels": "Choose one or more EM06 channels."
+    },
+    "abort": {
+      "already_configured": "This Refoss device is already configured.",
+      "no_devices": "No Refoss devices were found in this account."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Refoss Cloud options",
+        "description": "Adjust Refoss Cloud polling settings.",
+        "data": {
+          "scan_interval": "MQTT update interval (seconds)"
+        }
+      }
+    }
+  }
+}
