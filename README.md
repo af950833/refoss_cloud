@@ -190,7 +190,7 @@ HACS의 커스텀 저장소 기능을 사용해 설치할 수 있습니다.
 
 1. Home Assistant에서 **HACS**를 엽니다.
 2. 오른쪽 위 메뉴에서 **사용자 지정 저장소**를 선택합니다.
-3. 저장소 URL에 이 GitHub 저장소 주소를 입력합니다.
+3. 저장소 URL에 이 GitHub 저장소 주소(https://github.com/af950833/refoss_cloud)를 입력합니다.
 4. 카테고리는 **Integration**을 선택합니다.
 5. 저장소를 추가합니다.
 6. HACS에서 **Refoss Cloud**를 검색해 설치합니다.
@@ -202,7 +202,7 @@ HACS의 커스텀 저장소 기능을 사용해 설치할 수 있습니다.
 Home Assistant 설정 폴더 아래에 통합 폴더를 직접 복사합니다.
 
 ```text
-custom_components/refoss_cloud
+/config/custom_components/refoss_cloud
 ```
 
 폴더 구조 예:
