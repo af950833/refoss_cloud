@@ -1,6 +1,3 @@
-# refoss_cloud
-Home Assistant Refoss Cloud custom component
-
 # Refoss Cloud for Home Assistant
 
 Refoss Cloud는 Refoss EM06 전력량계를 Home Assistant에서 사용하기 위한
