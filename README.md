@@ -187,6 +187,22 @@ factor          -> PF
 
 ## 설치 방법
 
+### HACS로 설치
+
+1. Home Assistant에서 **HACS**를 엽니다.
+2. 오른쪽 위 메뉴에서 **사용자 정의 저장소**를 선택합니다.
+3. 저장소 주소에 다음 URL을 입력합니다.
+
+```text
+https://github.com/af950833/refoss_cloud
+```
+
+4. 카테고리는 **통합 구성요소**를 선택합니다.
+5. **추가**를 누른 뒤 HACS에서 **Refoss Cloud**를 검색해 설치합니다.
+6. 설치가 끝나면 Home Assistant를 재시작합니다.
+
+### 수동 설치
+
 Home Assistant 설정 폴더 아래에 통합 폴더를 복사합니다.
 
 ```text
