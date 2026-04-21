@@ -63,6 +63,8 @@ DEFAULT_API_BASE = "https://iotx.refoss.net"
 SECRET = "23x17ahWarFH6w29"
 SENSOR_SLUG = "billing_month_energy"
 SENSOR_LABEL = "Billing month energy"
+TODAY_SENSOR_SLUG = "this_day_energy"
+TODAY_SENSOR_LABEL = "This Day Energy"
 
 # EM06은 내부적으로 채널을 1~6으로 다루지만, 앱/실제 배선 표기는
 # A1/B1/C1/A2/B2/C2가 더 자연스럽다. unique_id는 번호 기반으로 유지한다.
@@ -137,10 +139,13 @@ class ChannelData:
     # net_wh는 HA에 표시할 검침월 순사용량이다. 태양광 채널처럼 순방향보다
     # 역방향이 크면 음수가 될 수 있으므로 abs 처리는 하지 않는다.
     net_wh: int
+    today_wh: int
     current_mconsume_wh: int
     month_prefix_wh: int
     previous_period_wh: int
     history_rows: int
+    today_prefix_wh: int
+    today_history_rows: int
     current_ma: int
     voltage_mv: int
     power_mw: int
@@ -154,6 +159,14 @@ class HistoryPrefix:
     # HTTP history는 과거 일별 보정용이다. 현재값은 MQTT mConsume을 사용한다.
     month_prefix_wh: int
     previous_period_wh: int
+    history_rows: int
+
+
+@dataclass(slots=True)
+class TodayPrefix:
+    """Cached current-month daily history before today."""
+
+    before_today_wh: int
     history_rows: int
 
 
@@ -230,6 +243,16 @@ async def _async_setup_sensors(
                 uuid=config[CONF_UUID],
                 channel=channel,
                 reading_day=reading_day,
+            )
+        )
+        # 오늘 사용량 센서. 현재 월누적 mConsume에서 월초~어제까지의 HTTP daily history를
+        # 빼서 계산하므로, 현재값은 MQTT 갱신 주기를 따라가고 HTTP는 캐시된다.
+        entities.append(
+            RefossCloudTodayEnergySensor(
+                coordinator=coordinator,
+                name=config[CONF_NAME],
+                uuid=config[CONF_UUID],
+                channel=channel,
             )
         )
         # 앱에 보이는 현재 전력/전압/역률/전류 센서.
@@ -401,6 +424,7 @@ class RefossCloudClient:
         self._mqtt_domain: str | None = None
         self._api_base = DEFAULT_API_BASE
         self._history_cache: dict[tuple[int, int, int, bool, str], HistoryPrefix] = {}
+        self._today_cache: dict[tuple[int, int, int, str], TodayPrefix] = {}
 
     async def async_billing_period_energy(
         self,
@@ -418,6 +442,7 @@ class RefossCloudClient:
         history = await self._async_history_prefix(
             channel, period, history_refresh_token
         )
+        today = await self._async_today_prefix(channel, history_refresh_token)
 
         # Refoss mConsume은 해당 월 1일부터 현재까지의 누적값이다.
         # 검침일이 이미 지났으면: 월초~검침 전날(prefix)을 빼서 검침일 이후만 남긴다.
@@ -428,10 +453,13 @@ class RefossCloudClient:
                 - history.month_prefix_wh
                 + history.previous_period_wh
             ),
+            today_wh=current_mconsume_wh - today.before_today_wh,
             current_mconsume_wh=current_mconsume_wh,
             month_prefix_wh=history.month_prefix_wh,
             previous_period_wh=history.previous_period_wh,
             history_rows=history.history_rows,
+            today_prefix_wh=today.before_today_wh,
+            today_history_rows=today.history_rows,
             current_ma=snapshot.current_ma,
             voltage_mv=snapshot.voltage_mv,
             power_mw=snapshot.power_mw,
@@ -492,6 +520,41 @@ class RefossCloudClient:
         )
         self._history_cache[cache_key] = history
         return history
+
+    async def _async_today_prefix(
+        self, channel: int, history_refresh_token: str
+    ) -> TodayPrefix:
+        """Fetch or return cached current-month usage before today."""
+
+        now = dt_util.now()
+        month_start = int(datetime(now.year, now.month, 1, tzinfo=UTC).timestamp())
+        today_start = int(
+            datetime(now.year, now.month, now.day, tzinfo=UTC).timestamp()
+        )
+        cache_key = (channel, month_start, today_start, history_refresh_token)
+        if cache_key in self._today_cache:
+            return self._today_cache[cache_key]
+
+        stale_keys = [key for key in self._today_cache if key[0] == channel]
+        for key in stale_keys:
+            self._today_cache.pop(key, None)
+
+        if today_start <= month_start:
+            today = TodayPrefix(before_today_wh=0, history_rows=0)
+        else:
+            rows = await self._async_electric_history(
+                channel=channel,
+                start_time=month_start,
+                end_time=today_start - 1,
+                step="1d",
+            )
+            today = TodayPrefix(
+                before_today_wh=sum(_row_net_wh(row) for row in rows),
+                history_rows=len(rows),
+            )
+
+        self._today_cache[cache_key] = today
+        return today
 
     async def async_current_electricity(self) -> dict[int, ChannelElectricity]:
         """Fetch current ElectricityX values through Refoss cloud MQTT."""
@@ -939,6 +1002,83 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
         return {
             **attrs,
         }
+
+    async def async_update(self) -> None:
+        """Update the entity."""
+
+        await self.coordinator.async_request_refresh()
+
+
+class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
+    """Refoss Cloud current-day energy sensor."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 3
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator[dict[int, ChannelData]],
+        name: str,
+        uuid: str,
+        channel: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._channel = channel
+        self._attr_unique_id = (
+            f"{uuid}_{_channel_label(channel).lower()}_{TODAY_SENSOR_SLUG}"
+        )
+        self._attr_name = f"{name} {_channel_label(channel)} {TODAY_SENSOR_LABEL}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, uuid)},
+            "name": name,
+            "manufacturer": "Refoss",
+            "model": "EM06",
+        }
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+
+        return self.coordinator.last_update_success and self._channel in (
+            self.coordinator.data or {}
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return today's net energy in kWh."""
+
+        data = (self.coordinator.data or {}).get(self._channel)
+        if data is None:
+            return None
+
+        return round(data.today_wh / 1000, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra attributes."""
+
+        now = dt_util.now()
+        data = (self.coordinator.data or {}).get(self._channel)
+        attrs: dict[str, Any] = {
+            "channel": self._channel,
+            "channel_label": _channel_label(self._channel),
+            "kind": "net",
+            "date": now.date().isoformat(),
+            "source": "cloud_mqtt_mconsume_minus_http_daily_history",
+        }
+        if data is None:
+            return attrs
+
+        attrs.update(
+            {
+                "current_mconsume_kwh": round(data.current_mconsume_wh / 1000, 3),
+                "today_prefix_kwh": round(data.today_prefix_wh / 1000, 3),
+                "today_history_rows": data.today_history_rows,
+            }
+        )
+        return attrs
 
     async def async_update(self) -> None:
         """Update the entity."""
