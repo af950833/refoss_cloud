@@ -18,6 +18,7 @@ import struct
 import time
 from typing import Any
 
+from aiohttp import ClientError
 import voluptuous as vol
 
 from homeassistant.components.sensor import (
@@ -501,15 +502,22 @@ class RefossCloudClient:
         # socket 기반 MQTT 처리는 blocking I/O라 Home Assistant event loop를
         # 막지 않도록 worker thread에서 실행한다.
         last_err: OSError | TimeoutError | None = None
-        for attempt in range(2):
+        max_attempts = 3
+        for attempt in range(max_attempts):
             try:
                 return await asyncio.to_thread(self._mqtt_current_electricity)
             except (OSError, TimeoutError) as err:
                 last_err = err
-                if attempt == 0:
-                    # DNS나 외부망 연결이 몇 초 흔들리는 경우가 있어 한 번만 조용히 재시도한다.
-                    _LOGGER.debug("Refoss MQTT update failed, retrying once: %s", err)
-                    await asyncio.sleep(1)
+                if attempt < max_attempts - 1:
+                    # DNS/외부망 연결 또는 MQTT 응답 읽기가 몇 초 흔들리는 경우가 있어
+                    # 2초 간격으로 두 번까지 조용히 재시도한다.
+                    _LOGGER.debug(
+                        "Refoss MQTT update failed, retrying attempt %s/%s: %s",
+                        attempt + 2,
+                        max_attempts,
+                        err,
+                    )
+                    await asyncio.sleep(2)
 
         if last_err is not None:
             raise last_err
@@ -722,18 +730,38 @@ class RefossCloudClient:
             "Content-Type": "application/json",
         }
 
-        async with self._session.post(
-            f"{self._api_base}{path}",
-            json={
-                "params": encoded_params,
-                "sign": sign,
-                "timestamp": timestamp,
-                "nonce": nonce,
-            },
-            headers=headers,
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        last_err: ClientError | OSError | TimeoutError | None = None
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                async with self._session.post(
+                    f"{self._api_base}{path}",
+                    json={
+                        "params": encoded_params,
+                        "sign": sign,
+                        "timestamp": timestamp,
+                        "nonce": nonce,
+                    },
+                    headers=headers,
+                ) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except (ClientError, OSError, TimeoutError) as err:
+                last_err = err
+                if attempt < max_attempts - 1:
+                    # HTTP API도 자정 직후나 외부망 상태에 따라 잠깐 실패할 수 있으므로
+                    # MQTT와 같은 정책으로 2초 간격 두 번까지 조용히 재시도한다.
+                    _LOGGER.debug(
+                        "Refoss HTTP request failed, retrying attempt %s/%s: %s",
+                        attempt + 2,
+                        max_attempts,
+                        err,
+                    )
+                    await asyncio.sleep(2)
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("Refoss HTTP request failed")
 
     @staticmethod
     def _raise_for_api_error(response: dict[str, Any]) -> None:
