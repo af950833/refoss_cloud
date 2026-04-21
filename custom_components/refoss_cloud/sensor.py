@@ -500,7 +500,20 @@ class RefossCloudClient:
 
         # socket 기반 MQTT 처리는 blocking I/O라 Home Assistant event loop를
         # 막지 않도록 worker thread에서 실행한다.
-        return await asyncio.to_thread(self._mqtt_current_electricity)
+        last_err: OSError | TimeoutError | None = None
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(self._mqtt_current_electricity)
+            except (OSError, TimeoutError) as err:
+                last_err = err
+                if attempt == 0:
+                    # DNS나 외부망 연결이 몇 초 흔들리는 경우가 있어 한 번만 조용히 재시도한다.
+                    _LOGGER.debug("Refoss MQTT update failed, retrying once: %s", err)
+                    await asyncio.sleep(1)
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("Refoss MQTT ElectricityX response failed")
 
     async def _async_electric_history(
         self, channel: int, start_time: int, end_time: int, step: str
