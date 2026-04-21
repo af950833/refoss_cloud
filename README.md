@@ -4,13 +4,15 @@ Refoss Cloud는 Refoss EM06 전력량계를 Home Assistant에서 사용하기 �
 커스텀 통합 구성요소입니다.
 
 Refoss 클라우드에서 EM06 채널 데이터를 가져와 검침일 기준 월 사용량,
-현재 전력, 전압, 역률, 전류 센서를 Home Assistant에 생성합니다.
+오늘 사용량, 현재 전력, 전압, 역률, 전류 센서를 Home Assistant에 생성합니다.
 
 이 통합은 전기 검침일이 매월 1일이 아닌 가정에서 사용하기 위해 만들었습니다.
+또한 순사용량 값을 그대로 사용하므로, 태양광 패널이 연결된 채널처럼 역방향
+전력이 발생하는 경우 월 사용량이 음수로 표시될 수 있습니다.
 
 ## 주요 기능
 
-- Refoss 계정 로그인을 위한 GUI Config Flow 지원
+- Refoss 계정 로그인을 위한 GUI 설정 흐름
 - Refoss 클라우드 계정의 EM06 기기 선택
 - EM06 채널 선택
   - `A1`
@@ -20,8 +22,9 @@ Refoss 클라우드에서 EM06 채널 데이터를 가져와 검침일 기준 �
   - `B2`
   - `C2`
 - 선택한 채널별 검침월 순사용량 센서
+- 선택한 채널별 오늘 순사용량 센서
 - 선택한 채널별 현재값 센서
-  - 전력
+  - 현재 전력
   - 전압
   - 역률
   - 전류
@@ -145,12 +148,14 @@ HTTP history는 매번 조회하지 않고 캐시합니다. 갱신 시점은 다
 
 ## 생성되는 센서
 
-선택한 채널마다 검침월 사용량 센서 1개와 현재값 센서 4개가 생성됩니다.
+선택한 채널마다 검침월 사용량 센서 1개, 오늘 사용량 센서 1개,
+현재값 센서 4개가 생성됩니다.
 
 예: `A1` 채널
 
 ```text
 Refoss EM06 A1 Billing month energy
+Refoss EM06 A1 This Day Energy
 Refoss EM06 A1 Power
 Refoss EM06 A1 Voltage
 Refoss EM06 A1 PF
@@ -182,27 +187,10 @@ factor          -> PF
 
 ## 설치 방법
 
-설치 방법은 두 가지입니다.
-
-## HACS로 설치
-
-HACS의 커스텀 저장소 기능을 사용해 설치할 수 있습니다.
-
-1. Home Assistant에서 **HACS**를 엽니다.
-2. 오른쪽 위 메뉴에서 **사용자 지정 저장소**를 선택합니다.
-3. 저장소 URL에 이 GitHub 저장소 주소(https://github.com/af950833/refoss_cloud)를 입력합니다.
-4. 카테고리는 **Integration**을 선택합니다.
-5. 저장소를 추가합니다.
-6. HACS에서 **Refoss Cloud**를 검색해 설치합니다.
-7. Home Assistant를 재시작합니다.
-8. **설정** > **기기 및 서비스** > **통합 구성요소 추가**에서 **Refoss Cloud**를 추가합니다.
-
-## 수동 설치
-
-Home Assistant 설정 폴더 아래에 통합 폴더를 직접 복사합니다.
+Home Assistant 설정 폴더 아래에 통합 폴더를 복사합니다.
 
 ```text
-/config/custom_components/refoss_cloud
+custom_components/refoss_cloud
 ```
 
 폴더 구조 예:
