@@ -6,7 +6,7 @@ import base64
 from calendar import monthrange
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import logging
@@ -49,8 +49,7 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Config entry/YAML에서 사용하는 내부 키들이다.
-# CONF_READING_DAY는 1~27 또는 "last"를 받을 수 있다.
+# Config entry and YAML option keys.
 CONF_CHANNELS = "channels"
 CONF_READING_DAY = "reading_day"
 CONF_UUID = "uuid"
@@ -59,15 +58,13 @@ READING_DAY_LAST = "last"
 DEFAULT_NAME = "Refoss Cloud"
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=15)
 DEFAULT_API_BASE = "https://iotx.refoss.net"
-# Refoss/Meross cloud HTTP API 서명에 쓰이는 고정 salt.
+# Fixed salt used by the Refoss/Meross HTTP API signature.
 SECRET = "23x17ahWarFH6w29"
 SENSOR_SLUG = "billing_month_energy"
 SENSOR_LABEL = "Billing month energy"
 TODAY_SENSOR_SLUG = "this_day_energy"
 TODAY_SENSOR_LABEL = "This Day Energy"
 
-# EM06은 내부적으로 채널을 1~6으로 다루지만, 앱/실제 배선 표기는
-# A1/B1/C1/A2/B2/C2가 더 자연스럽다. unique_id는 번호 기반으로 유지한다.
 CHANNEL_LABELS = {
     1: "A1",
     2: "B1",
@@ -77,8 +74,7 @@ CHANNEL_LABELS = {
     6: "C2",
 }
 
-# ElectricityX MQTT 응답에는 현재 전력/전압/역률/전류가 한 번에 들어온다.
-# 아래 정의로 같은 MQTT 응답을 여러 센서가 나눠 쓰게 만든다.
+# ElectricityX returns mConsume and instantaneous values in one response.
 INSTANT_SENSOR_TYPES: dict[str, dict[str, Any]] = {
     "power": {
         "label": "Power",
@@ -123,8 +119,7 @@ PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
 class ChannelElectricity:
     """Current ElectricityX values for a Refoss channel."""
 
-    # Refoss 응답 단위:
-    # mConsume = Wh, current = mA, voltage = mV, power = mW, factor = 실수 PF.
+    # Raw Refoss units: Wh, mA, mV, mW, and PF as a float.
     mconsume_wh: int
     current_ma: int
     voltage_mv: int
@@ -133,18 +128,31 @@ class ChannelElectricity:
 
 
 @dataclass(slots=True)
+class ChannelConsumption:
+    """Recent ConsumptionH values for a Refoss channel."""
+
+    # ConsumptionH.total matches the app's current-day net energy value.
+    # data contains recent hourly-ish Wh rows used to correct yesterday.
+    today_wh: int
+    history_rows: int
+    date_totals_wh: dict[date, int]
+    latest_history_date: date | None
+
+
+@dataclass(slots=True)
 class ChannelData:
     """Energy and instantaneous values for a Refoss channel."""
 
-    # net_wh는 HA에 표시할 검침월 순사용량이다. 태양광 채널처럼 순방향보다
-    # 역방향이 크면 음수가 될 수 있으므로 abs 처리는 하지 않는다.
+    # net_wh is the billing-period net energy shown in HA.
+    # It may be negative on channels with solar generation.
     net_wh: int
     today_wh: int
     current_mconsume_wh: int
-    month_prefix_wh: int
-    previous_period_wh: int
+    completed_history_wh: int
+    recent_history_adjustment_wh: int
     history_rows: int
-    today_prefix_wh: int
+    billing_source: str
+    today_source: str
     today_history_rows: int
     current_ma: int
     voltage_mv: int
@@ -153,20 +161,12 @@ class ChannelData:
 
 
 @dataclass(slots=True)
-class HistoryPrefix:
-    """Cached billing-period history prefix values."""
+class CompletedDailyHistory:
+    """Cached completed daily history values for the billing period."""
 
-    # HTTP history는 과거 일별 보정용이다. 현재값은 MQTT mConsume을 사용한다.
-    month_prefix_wh: int
-    previous_period_wh: int
-    history_rows: int
-
-
-@dataclass(slots=True)
-class TodayPrefix:
-    """Cached current-month daily history before today."""
-
-    before_today_wh: int
+    # Completed daily rows from HTTP history, cached by billing period bucket.
+    daily_wh_by_date: dict[date, int]
+    undated_wh: int
     history_rows: int
 
 
@@ -200,6 +200,7 @@ async def async_setup_entry(
         config=config,
         async_add_entities=async_add_entities,
         scan_interval=_scan_interval_from_config(config),
+        entry=entry,
     )
 
 
@@ -208,6 +209,7 @@ async def _async_setup_sensors(
     config: dict[str, Any],
     async_add_entities: AddEntitiesCallback,
     scan_interval: timedelta,
+    entry: ConfigEntry | None = None,
 ) -> None:
     """Set up Refoss Cloud sensors."""
 
@@ -217,25 +219,26 @@ async def _async_setup_sensors(
         password=config[CONF_PASSWORD],
         uuid=config[CONF_UUID],
     )
-    # dict.fromkeys로 순서를 유지하면서 중복 채널을 제거한다.
+    # Preserve order while dropping duplicate channels.
     channels = [int(channel) for channel in dict.fromkeys(config[CONF_CHANNELS])]
     reading_day = _normalize_reading_day(config[CONF_READING_DAY])
 
-    # 하나의 coordinator가 모든 채널/모든 센서를 갱신한다.
-    # MQTT ElectricityX는 갱신마다 1회만 호출하고, 채널별 센서가 그 결과를 공유한다.
+    # One coordinator refreshes all channels and all entity types.
     coordinator: DataUpdateCoordinator[dict[int, ChannelData]] = DataUpdateCoordinator(
         hass,
         logger=_LOGGER,
         name=f"{DOMAIN}_{config[CONF_UUID]}",
         update_interval=scan_interval,
-        update_method=lambda: _async_update_data(client, channels, reading_day),
+        update_method=lambda: _async_update_data(
+            client, channels, reading_day
+        ),
     )
 
     await coordinator.async_config_entry_first_refresh()
 
     entities: list[SensorEntity] = []
     for channel in channels:
-        # 검침일 기준 월 사용량 센서.
+        # Billing-period net energy.
         entities.append(
             RefossCloudEnergySensor(
                 coordinator=coordinator,
@@ -245,8 +248,7 @@ async def _async_setup_sensors(
                 reading_day=reading_day,
             )
         )
-        # 오늘 사용량 센서. 현재 월누적 mConsume에서 월초~어제까지의 HTTP daily history를
-        # 빼서 계산하므로, 현재값은 MQTT 갱신 주기를 따라가고 HTTP는 캐시된다.
+        # Current-day net energy from ConsumptionH.total.
         entities.append(
             RefossCloudTodayEnergySensor(
                 coordinator=coordinator,
@@ -255,7 +257,7 @@ async def _async_setup_sensors(
                 channel=channel,
             )
         )
-        # 앱에 보이는 현재 전력/전압/역률/전류 센서.
+        # Instantaneous values shown by the app.
         for sensor_type in INSTANT_SENSOR_TYPES:
             entities.append(
                 RefossCloudInstantSensor(
@@ -271,21 +273,33 @@ async def _async_setup_sensors(
 
 
 async def _async_update_data(
-    client: RefossCloudClient, channels: list[int], reading_day: int | str
+    client: RefossCloudClient,
+    channels: list[int],
+    reading_day: int | str,
 ) -> dict[int, ChannelData]:
     """Fetch one billing-period snapshot for all configured channels."""
 
     try:
         period = _billing_period(reading_day)
-        # token은 날짜/시간 bucket이다. 같은 bucket에서는 HTTP history 캐시를
-        # 재사용하고, 날짜가 바뀌거나 00:05 재시도 시점이 오면 다시 조회한다.
+        # Reuse HTTP daily history except around midnight and 00:05.
         history_refresh_token = _history_refresh_token()
-        # 현재 mConsume과 전력/전압/전류/PF는 cloud MQTT에서 한 번에 받는다.
+        # Live mConsume and instantaneous values come from ElectricityX.
         current_electricity = await client.async_current_electricity()
+        try:
+            # The app's current-day energy screen uses ConsumptionH.total.
+            current_consumption = await client.async_current_consumption(channels)
+        except Exception as err:  # noqa: BLE001
+            # Keep the rest of the sensors updating if ConsumptionH fails.
+            _LOGGER.debug("Refoss ConsumptionH update failed: %s", err)
+            current_consumption = {}
         data: dict[int, ChannelData] = {}
         for channel in channels:
             data[channel] = await client.async_billing_period_energy(
-                channel, period, current_electricity, history_refresh_token
+                channel,
+                period,
+                current_electricity,
+                current_consumption,
+                history_refresh_token,
             )
         return data
     except Exception as err:  # noqa: BLE001
@@ -314,13 +328,13 @@ def _billing_period(reading_day: int | str) -> BillingPeriod:
     now = dt_util.now()
     month_start = datetime(now.year, now.month, 1, tzinfo=UTC)
 
-    # "말일" 설정은 매월 실제 마지막 날로 치환된다.
+    # "last" means the actual last day of each month.
     day_this_month = _reading_day_for_month(reading_day, now.year, now.month)
     local_start = datetime(
         now.year, now.month, day_this_month, tzinfo=now.tzinfo
     )
     if now < local_start:
-        # 아직 이번 달 검침일 전이면 현재 검침월은 전월 검침일에서 시작한다.
+        # Before this month's reading day, the billing period started last month.
         prev_month = now.month - 1 or 12
         prev_year = now.year if now.month > 1 else now.year - 1
         prev_day = _reading_day_for_month(reading_day, prev_year, prev_month)
@@ -328,7 +342,7 @@ def _billing_period(reading_day: int | str) -> BillingPeriod:
         daily_start = datetime(prev_year, prev_month, prev_day, tzinfo=UTC)
         period_started_this_month = False
     else:
-        # 이번 달 검침일이 지났으면 현재 검침월은 이번 달 검침일에서 시작한다.
+        # On or after this month's reading day, the billing period starts this month.
         daily_start = datetime(now.year, now.month, day_this_month, tzinfo=UTC)
         period_started_this_month = True
 
@@ -344,12 +358,11 @@ def _billing_period(reading_day: int | str) -> BillingPeriod:
 def _normalize_reading_day(value: Any) -> int | str:
     """Normalize configured reading day values."""
 
-    # 새 config flow는 "last"를 저장한다. 과거에 28~31이 저장된 경우도
-    # 사용자가 의도한 말일 검침으로 보고 호환 처리한다.
     if value == READING_DAY_LAST:
         return READING_DAY_LAST
 
     day = int(value)
+    # Older configs may have stored 28-31; treat them as "last day".
     if day >= 28:
         return READING_DAY_LAST
     return day
@@ -358,8 +371,8 @@ def _normalize_reading_day(value: Any) -> int | str:
 def _scan_interval_from_config(config: dict[str, Any]) -> timedelta:
     """Return the configured MQTT polling interval."""
 
-    # config flow는 초 단위 정수를 저장하고, YAML은 timedelta를 넘길 수 있다.
     value = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    # Config flow stores seconds, while YAML may already pass a timedelta.
     if isinstance(value, timedelta):
         seconds = int(value.total_seconds())
     else:
@@ -389,8 +402,7 @@ def _history_refresh_token() -> str:
     midnight_retry = now.replace(hour=0, minute=5, second=0, microsecond=0)
     midnight_first = now.replace(hour=0, minute=0, second=5, microsecond=0)
 
-    # 00:00:05 전에는 전날 bucket을 그대로 써서 자정 직후 불완전한
-    # 일별 history를 너무 빨리 캐시하지 않는다.
+    # Avoid caching incomplete daily history immediately after midnight.
     if now >= midnight_retry:
         date = now.date().isoformat()
         bucket = "0005"
@@ -423,182 +435,190 @@ class RefossCloudClient:
         self._key: str | None = None
         self._mqtt_domain: str | None = None
         self._api_base = DEFAULT_API_BASE
-        self._history_cache: dict[tuple[int, int, int, bool, str], HistoryPrefix] = {}
-        self._today_cache: dict[tuple[int, int, int, str], TodayPrefix] = {}
+        self._history_cache: dict[
+            tuple[int, int, str], CompletedDailyHistory
+        ] = {}
+        self._mqtt_lock = asyncio.Lock()
 
     async def async_billing_period_energy(
         self,
         channel: int,
         period: BillingPeriod,
         current_electricity: dict[int, ChannelElectricity],
+        current_consumption: dict[int, ChannelConsumption],
         history_refresh_token: str,
     ) -> ChannelData:
         """Fetch electric history for one billing-period channel."""
 
         snapshot = current_electricity[channel]
         current_mconsume_wh = snapshot.mconsume_wh
-        # 검침월 보정값은 HTTP daily history에서 가져오지만, 매번 조회하지 않고
-        # _async_history_prefix 내부 캐시를 우선 사용한다.
-        history = await self._async_history_prefix(
+        # Billing month energy uses cached completed daily history. Today's
+        # live value comes from ConsumptionH.total below.
+        history = await self._async_completed_billing_history(
             channel, period, history_refresh_token
         )
-        today = await self._async_today_prefix(channel, history_refresh_token)
-        mconsume_today_wh = current_mconsume_wh - today.before_today_wh
+        today = dt_util.now().date()
+        consumption = current_consumption.get(channel)
+        if consumption is not None:
+            if (
+                consumption.latest_history_date is not None
+                and consumption.latest_history_date < today
+            ):
+                today_wh = 0
+                today_source = "stale_cloud_mqtt_consumptionh_total"
+            else:
+                today_wh = consumption.today_wh
+                today_source = "cloud_mqtt_consumptionh_total"
+            today_history_rows = consumption.history_rows
+        else:
+            today_wh = 0
+            today_source = "unavailable_consumptionh"
+            today_history_rows = 0
 
-        # Refoss mConsume은 해당 월 1일부터 현재까지의 누적값이다.
-        # 검침일이 이미 지났으면: 월초~검침 전날(prefix)을 빼서 검침일 이후만 남긴다.
-        # 검침일 전이면: 지난달 검침일~말일(previous_period)을 더해 현재 검침월을 완성한다.
+        # Only yesterday is overridden with ConsumptionH hourly totals. Older
+        # completed days stay on HTTP daily history to keep cloud calls low.
+        yesterday = today - timedelta(days=1)
+        period_start_date = datetime.fromtimestamp(
+            period.local_start, dt_util.DEFAULT_TIME_ZONE
+        ).date()
+        daily_wh_by_date = dict(history.daily_wh_by_date)
+        recent_history_adjustment_wh = 0
+        if consumption is not None:
+            for row_date, row_wh in consumption.date_totals_wh.items():
+                if row_date != yesterday or row_date < period_start_date:
+                    continue
+                old_wh = daily_wh_by_date.get(row_date, 0)
+                daily_wh_by_date[row_date] = row_wh
+                recent_history_adjustment_wh += row_wh - old_wh
+
+        completed_history_wh = history.undated_wh + sum(daily_wh_by_date.values())
+        billing_source = "cloud_http_daily_history_plus_cloud_mqtt_consumptionh_total"
+        if recent_history_adjustment_wh:
+            billing_source += "_with_yesterday_consumptionh_override"
+        if consumption is None:
+            billing_source = "cloud_http_daily_history_consumptionh_unavailable"
+
         return ChannelData(
-            net_wh=(
-                current_mconsume_wh
-                - history.month_prefix_wh
-                + history.previous_period_wh
-            ),
-            today_wh=mconsume_today_wh,
+            net_wh=completed_history_wh + today_wh,
+            today_wh=today_wh,
             current_mconsume_wh=current_mconsume_wh,
-            month_prefix_wh=history.month_prefix_wh,
-            previous_period_wh=history.previous_period_wh,
+            completed_history_wh=completed_history_wh,
+            recent_history_adjustment_wh=recent_history_adjustment_wh,
             history_rows=history.history_rows,
-            today_prefix_wh=today.before_today_wh,
-            today_history_rows=today.history_rows,
+            billing_source=billing_source,
+            today_source=today_source,
+            today_history_rows=today_history_rows,
             current_ma=snapshot.current_ma,
             voltage_mv=snapshot.voltage_mv,
             power_mw=snapshot.power_mw,
             factor=snapshot.factor,
         )
 
-    async def _async_history_prefix(
+    async def _async_completed_billing_history(
         self,
         channel: int,
         period: BillingPeriod,
         history_refresh_token: str,
-    ) -> HistoryPrefix:
-        """Fetch or return cached HTTP history correction values."""
+    ) -> CompletedDailyHistory:
+        """Fetch completed daily usage rows for the current billing period."""
 
-        cache_key = (
-            channel,
-            period.daily_start,
-            period.month_start,
-            period.period_started_this_month,
-            history_refresh_token,
-        )
+        cache_key = (channel, period.daily_start, history_refresh_token)
         if cache_key in self._history_cache:
             return self._history_cache[cache_key]
 
-        # 같은 채널의 오래된 캐시는 새 bucket이 생겼을 때 정리한다.
-        # 채널 수가 작아도 장기 실행 중 cache key가 계속 쌓이지 않게 하기 위함이다.
         stale_keys = [key for key in self._history_cache if key[0] == channel]
         for key in stale_keys:
             self._history_cache.pop(key, None)
 
-        if period.period_started_this_month:
-            # 검침일이 이번 달에 이미 지났다면, 현재 mConsume에서 월초~검침 전날
-            # 사용량을 빼야 한다.
-            rows = await self._async_electric_history(
-                channel=channel,
-                start_time=period.month_start,
-                end_time=period.daily_start - 1,
-                step="1d",
-            )
-            month_prefix_wh = sum(_row_net_wh(row) for row in rows)
-            previous_period_wh = 0
-        else:
-            # 아직 이번 달 검침일 전이면, 지난달 검침일~지난달 말일 사용량을
-            # 이번 달 mConsume에 더해야 한다.
+        today = dt_util.now()
+        today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+        end_time = int(today_start.timestamp()) - 1
+        rows: list[dict[str, Any]] = []
+        if period.daily_start <= end_time:
             rows = await self._async_electric_history(
                 channel=channel,
                 start_time=period.daily_start,
-                end_time=period.month_start - 1,
+                end_time=end_time,
                 step="1d",
             )
-            month_prefix_wh = 0
-            previous_period_wh = sum(_row_net_wh(row) for row in rows)
 
-        history = HistoryPrefix(
-            month_prefix_wh=month_prefix_wh,
-            previous_period_wh=previous_period_wh,
+        daily_wh_by_date: dict[date, int] = {}
+        undated_wh = 0
+        for row in rows:
+            row_date = _row_local_date(row)
+            row_wh = _row_net_wh(row)
+            if row_date is None:
+                undated_wh += row_wh
+                continue
+            daily_wh_by_date[row_date] = daily_wh_by_date.get(row_date, 0) + row_wh
+
+        history = CompletedDailyHistory(
+            daily_wh_by_date=daily_wh_by_date,
+            undated_wh=undated_wh,
             history_rows=len(rows),
         )
         self._history_cache[cache_key] = history
         return history
 
-    async def _async_today_prefix(
-        self, channel: int, history_refresh_token: str
-    ) -> TodayPrefix:
-        """Fetch or return cached current-month usage before today."""
-
-        now = dt_util.now()
-        month_start = int(datetime(now.year, now.month, 1, tzinfo=UTC).timestamp())
-        today_start = int(
-            datetime(now.year, now.month, now.day, tzinfo=UTC).timestamp()
-        )
-        cache_key = (
-            channel,
-            month_start,
-            today_start,
-            history_refresh_token,
-        )
-        if cache_key in self._today_cache:
-            return self._today_cache[cache_key]
-
-        stale_keys = [key for key in self._today_cache if key[0] == channel]
-        for key in stale_keys:
-            self._today_cache.pop(key, None)
-
-        if today_start <= month_start:
-            today = TodayPrefix(
-                before_today_wh=0,
-                history_rows=0,
-            )
-        else:
-            rows = await self._async_electric_history(
-                channel=channel,
-                start_time=month_start,
-                end_time=today_start - 1,
-                step="1d",
-            )
-            rows = _history_rows_before_cutoff(
-                rows,
-                cutoff=today_start,
-                max_rows=(today_start - month_start) // 86400,
-            )
-            today = TodayPrefix(
-                before_today_wh=sum(_row_net_wh(row) for row in rows),
-                history_rows=len(rows),
-            )
-
-        self._today_cache[cache_key] = today
-        return today
-
-    async def async_current_electricity(self) -> dict[int, ChannelElectricity]:
+    async def async_current_electricity(
+        self, max_attempts: int = 3
+    ) -> dict[int, ChannelElectricity]:
         """Fetch current ElectricityX values through Refoss cloud MQTT."""
 
         if self._token is None:
             await self.async_login()
 
-        # socket 기반 MQTT 처리는 blocking I/O라 Home Assistant event loop를
-        # 막지 않도록 worker thread에서 실행한다.
+        # Socket MQTT is blocking I/O, so run it in a worker thread.
         last_err: OSError | TimeoutError | None = None
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                return await asyncio.to_thread(self._mqtt_current_electricity)
-            except (OSError, TimeoutError) as err:
-                last_err = err
-                if attempt < max_attempts - 1:
-                    # DNS/외부망 연결 또는 MQTT 응답 읽기가 몇 초 흔들리는 경우가 있어
-                    # 2초 간격으로 두 번까지 조용히 재시도한다.
-                    _LOGGER.debug(
-                        "Refoss MQTT update failed, retrying attempt %s/%s: %s",
-                        attempt + 2,
-                        max_attempts,
-                        err,
-                    )
-                    await asyncio.sleep(2)
+        async with self._mqtt_lock:
+            for attempt in range(max_attempts):
+                try:
+                    return await asyncio.to_thread(self._mqtt_current_electricity)
+                except (OSError, TimeoutError) as err:
+                    last_err = err
+                    if attempt < max_attempts - 1:
+                        # Retry transient DNS, network, or MQTT response delays.
+                        _LOGGER.debug(
+                            "Refoss MQTT update failed, retrying attempt %s/%s: %s",
+                            attempt + 2,
+                            max_attempts,
+                            err,
+                        )
+                        await asyncio.sleep(2)
 
         if last_err is not None:
             raise last_err
         raise RuntimeError("Refoss MQTT ElectricityX response failed")
+
+    async def async_current_consumption(
+        self, channels: list[int], max_attempts: int = 3
+    ) -> dict[int, ChannelConsumption]:
+        """Fetch current-day ConsumptionH values through Refoss cloud MQTT."""
+
+        if self._token is None:
+            await self.async_login()
+
+        last_err: OSError | TimeoutError | RuntimeError | None = None
+        async with self._mqtt_lock:
+            for attempt in range(max_attempts):
+                try:
+                    return await asyncio.to_thread(
+                        self._mqtt_current_consumption, channels
+                    )
+                except (OSError, TimeoutError, RuntimeError) as err:
+                    last_err = err
+                    if attempt < max_attempts - 1:
+                        _LOGGER.debug(
+                            "Refoss ConsumptionH update failed, retrying attempt %s/%s: %s",
+                            attempt + 2,
+                            max_attempts,
+                            err,
+                        )
+                        await asyncio.sleep(2)
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("Refoss MQTT ConsumptionH response failed")
 
     async def _async_electric_history(
         self, channel: int, start_time: int, end_time: int, step: str
@@ -623,7 +643,7 @@ class RefossCloudClient:
         if self._token is None:
             await self.async_login()
 
-        # HTTP history는 현재값이 아니라 과거 일별 합계 보정용으로만 쓴다.
+        # HTTP history is used only for completed daily billing-period rows.
         response = await self._async_post(
             "/historage/v1/deviceTelemetry/query", payload, token=self._token
         )
@@ -645,8 +665,7 @@ class RefossCloudClient:
     async def async_login(self) -> dict[str, Any]:
         """Log in and cache the Refoss cloud token."""
 
-        # Refoss 앱과 같은 방식으로 비밀번호 MD5를 보낸다. 이후 응답의 token은
-        # HTTP API에, userid/key/mqttDomain은 cloud MQTT 인증에 사용한다.
+        # The Refoss app sends an MD5 password hash, then returns HTTP/MQTT auth data.
         password_md5 = hashlib.md5(self._password.encode("utf8")).hexdigest()
         response = await self._async_post(
             "/v1/Auth/signIn",
@@ -685,8 +704,7 @@ class RefossCloudClient:
         client_id = f"app:{app_id}"
         password = hashlib.md5(f"{self._userid}{self._key}".encode()).hexdigest()
 
-        # 상시 subscribe 방식이 아니라, 앱처럼 GET 요청을 MQTT로 publish하고
-        # 해당 messageId의 GETACK 응답을 기다리는 요청/응답 방식이다.
+        # Publish a GET request and wait for the matching messageId GETACK.
         raw_socket = socket.create_connection((self._mqtt_domain, 443), timeout=12)
         with ssl.create_default_context().wrap_socket(
             raw_socket, server_hostname=self._mqtt_domain
@@ -705,7 +723,7 @@ class RefossCloudClient:
             if packet_type != 0x20 or packet[-1] != 0:
                 raise RuntimeError("Refoss MQTT connection failed")
 
-            # 응답은 /app/<userid>-<appid>/subscribe 토픽으로 돌아온다.
+            # Responses arrive on the app subscribe topic.
             subscribe = struct.pack("!H", 1) + _mqtt_string(app_topic) + b"\x00"
             mqtt.sendall(_mqtt_packet(0x82, subscribe))
             packet_type, packet = _mqtt_read_packet(mqtt)
@@ -717,8 +735,7 @@ class RefossCloudClient:
             sign = hashlib.md5(
                 f"{message_id}{self._key}{timestamp}".encode()
             ).hexdigest()
-            # ElectricityX는 mConsume, power, voltage, current, factor를
-            # 채널별로 한 번에 돌려준다.
+            # ElectricityX returns all EM06 channel readings in one request.
             message = {
                 "header": {
                     "from": app_topic,
@@ -756,7 +773,7 @@ class RefossCloudClient:
                 ):
                     continue
 
-                # Refoss 응답 정수 단위는 센서 클래스에서 사람이 읽는 단위로 변환한다.
+                # Store raw units; entity classes convert them for HA display.
                 rows = payload.get("payload", {}).get("electricity", [])
                 return {
                     int(row["channel"]): ChannelElectricity(
@@ -771,6 +788,119 @@ class RefossCloudClient:
                 }
 
             raise RuntimeError("Refoss MQTT ElectricityX response timed out")
+
+    def _mqtt_current_consumption(
+        self, channels: list[int]
+    ) -> dict[int, ChannelConsumption]:
+        """Fetch ConsumptionH through the Refoss cloud MQTT broker."""
+
+        if self._userid is None or self._key is None or self._mqtt_domain is None:
+            raise RuntimeError("Refoss MQTT credentials are missing")
+
+        app_id = hashlib.md5(_random_string(16).encode()).hexdigest()
+        app_topic = f"/app/{self._userid}-{app_id}/subscribe"
+        client_id = f"app:{app_id}"
+        password = hashlib.md5(f"{self._userid}{self._key}".encode()).hexdigest()
+
+        raw_socket = socket.create_connection((self._mqtt_domain, 443), timeout=12)
+        with ssl.create_default_context().wrap_socket(
+            raw_socket, server_hostname=self._mqtt_domain
+        ) as mqtt:
+            mqtt.settimeout(12)
+            connect = (
+                _mqtt_string("MQTT")
+                + bytes([4, 0xC2])
+                + struct.pack("!H", 60)
+                + _mqtt_string(client_id)
+                + _mqtt_string(self._userid)
+                + _mqtt_string(password)
+            )
+            mqtt.sendall(_mqtt_packet(0x10, connect))
+            packet_type, packet = _mqtt_read_packet(mqtt)
+            if packet_type != 0x20 or packet[-1] != 0:
+                raise RuntimeError("Refoss MQTT connection failed")
+
+            subscribe = struct.pack("!H", 1) + _mqtt_string(app_topic) + b"\x00"
+            mqtt.sendall(_mqtt_packet(0x82, subscribe))
+            packet_type, packet = _mqtt_read_packet(mqtt)
+            if packet_type != 0x90 or packet[-1] == 0x80:
+                raise RuntimeError("Refoss MQTT subscribe failed")
+
+            result: dict[int, ChannelConsumption] = {}
+            for channel in channels:
+                message_id = hashlib.md5(f"{app_id}:{channel}".encode()).hexdigest()
+                timestamp = int(time.time())
+                sign = hashlib.md5(
+                    f"{message_id}{self._key}{timestamp}".encode()
+                ).hexdigest()
+                # ConsumptionH backs the app's current-day and hourly energy views.
+                # 65535 does not answer reliably, so query one channel at a time.
+                message = {
+                    "header": {
+                        "from": app_topic,
+                        "messageId": message_id,
+                        "method": "GET",
+                        "namespace": "Appliance.Control.ConsumptionH",
+                        "payloadVersion": 1,
+                        "sign": sign,
+                        "timestamp": timestamp,
+                        "triggerSrc": "HA",
+                        "uuid": self._uuid,
+                    },
+                    "payload": {"consumptionH": [{"channel": channel}]},
+                }
+                publish_topic = f"/appliance/{self._uuid}/subscribe"
+                mqtt.sendall(
+                    _mqtt_packet(
+                        0x30,
+                        _mqtt_string(publish_topic)
+                        + json.dumps(message, separators=(",", ":")).encode(),
+                    )
+                )
+
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    packet_type, packet = _mqtt_read_packet(mqtt)
+                    if packet_type != 0x30:
+                        continue
+
+                    topic_length = struct.unpack("!H", packet[:2])[0]
+                    payload = json.loads(packet[2 + topic_length :].decode())
+                    if (
+                        payload.get("header", {}).get("messageId") != message_id
+                        or payload.get("header", {}).get("method") != "GETACK"
+                    ):
+                        continue
+
+                    rows = payload.get("payload", {}).get("consumptionH", [])
+                    for row in rows:
+                        if "channel" not in row or "total" not in row:
+                            continue
+                        date_totals_wh: dict[date, int] = {}
+                        for item in row.get("data") or []:
+                            item_date = _timestamp_local_date(item.get("timestamp"))
+                            if item_date is None:
+                                continue
+                            date_totals_wh[item_date] = (
+                                date_totals_wh.get(item_date, 0)
+                                + int(item.get("value") or 0)
+                            )
+                        latest_history_date = (
+                            max(date_totals_wh) if date_totals_wh else None
+                        )
+                        result[int(row["channel"])] = ChannelConsumption(
+                            today_wh=int(row["total"]),
+                            history_rows=len(row.get("data") or []),
+                            date_totals_wh=date_totals_wh,
+                            latest_history_date=latest_history_date,
+                        )
+                    break
+                else:
+                    raise RuntimeError(
+                        f"Refoss MQTT ConsumptionH response timed out for channel {channel}"
+                    )
+
+            return result
 
     async def async_devices(self) -> list[dict[str, Any]]:
         """Return devices from the Refoss cloud account."""
@@ -826,8 +956,7 @@ class RefossCloudClient:
             except (ClientError, OSError, TimeoutError) as err:
                 last_err = err
                 if attempt < max_attempts - 1:
-                    # HTTP API도 자정 직후나 외부망 상태에 따라 잠깐 실패할 수 있으므로
-                    # MQTT와 같은 정책으로 2초 간격 두 번까지 조용히 재시도한다.
+                    # Match the MQTT retry policy for transient HTTP failures.
                     _LOGGER.debug(
                         "Refoss HTTP request failed, retrying attempt %s/%s: %s",
                         attempt + 2,
@@ -851,8 +980,7 @@ class RefossCloudClient:
 def _row_net_wh(row: dict[str, Any]) -> int:
     """Return net Wh for one history row."""
 
-    # daily history의 value는 이미 순사용량이다. 태양광 채널처럼 생산이 더 크면
-    # 음수일 수 있으므로 그대로 사용한다.
+    # value is already net Wh. Solar channels may legitimately be negative.
     value = row.get("value")
     if value is not None:
         return int(value)
@@ -862,49 +990,41 @@ def _row_net_wh(row: dict[str, Any]) -> int:
     return valcons + valprod
 
 
-def _history_rows_before_cutoff(
-    rows: list[dict[str, Any]], cutoff: int, max_rows: int
-) -> list[dict[str, Any]]:
-    """Return daily history rows before a timestamp cutoff."""
+def _row_local_date(row: dict[str, Any]) -> date | None:
+    """Return the local date for a cloud history row when available."""
 
-    timestamped_rows = [
-        (timestamp, row)
-        for row in rows
-        if (timestamp := _row_timestamp(row)) is not None
-    ]
-    if timestamped_rows:
-        return [
-            row
-            for timestamp, row in sorted(timestamped_rows, key=lambda item: item[0])
-            if timestamp < cutoff
-        ]
+    for key in ("timestamp", "time", "ts"):
+        row_date = _timestamp_local_date(row.get(key))
+        if row_date is not None:
+            return row_date
 
-    # 일부 응답은 timestamp 없이 일별 row만 순서대로 줄 수 있다. 이때는
-    # 월초부터 어제까지 필요한 개수만 남겨 오늘 row가 prefix에 섞이지 않게 한다.
-    return rows[:max(0, max_rows)]
-
-
-def _row_timestamp(row: dict[str, Any]) -> int | None:
-    """Return a normalized seconds timestamp from one history row."""
-
-    for key in ("time", "timestamp", "timeStamp", "ts", "date"):
-        value = row.get(key)
-        if value is None:
-            continue
-        if isinstance(value, (int, float)):
-            timestamp = int(value)
-            return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
-        if isinstance(value, str):
-            try:
-                timestamp = int(value)
-            except ValueError:
-                try:
-                    return int(datetime.fromisoformat(value).timestamp())
-                except ValueError:
-                    continue
-            return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+    value = row.get("date")
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
 
     return None
+
+
+def _timestamp_local_date(value: Any) -> date | None:
+    """Convert a second or millisecond timestamp to a Home Assistant local date."""
+
+    if value in (None, ""):
+        return None
+
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if timestamp > 10_000_000_000:
+        timestamp //= 1000
+
+    return datetime.fromtimestamp(timestamp, UTC).astimezone(
+        dt_util.DEFAULT_TIME_ZONE
+    ).date()
 
 
 def _random_string(length: int) -> str:
@@ -919,7 +1039,7 @@ def _random_string(length: int) -> str:
 def _mqtt_string(value: str) -> bytes:
     """Encode an MQTT UTF-8 string."""
 
-    # MQTT 문자열은 2바이트 길이 prefix + UTF-8 bytes 형식이다.
+    # MQTT strings are a 2-byte length prefix followed by UTF-8 bytes.
     encoded = value.encode()
     return struct.pack("!H", len(encoded)) + encoded
 
@@ -927,7 +1047,7 @@ def _mqtt_string(value: str) -> bytes:
 def _mqtt_remaining_length(length: int) -> bytes:
     """Encode an MQTT remaining length field."""
 
-    # MQTT remaining length는 7비트씩 나눠서 가변 길이로 인코딩한다.
+    # MQTT remaining length uses a 7-bit variable-length encoding.
     result = b""
     while True:
         digit = length % 128
@@ -948,8 +1068,7 @@ def _mqtt_packet(packet_type: int, payload: bytes) -> bytes:
 def _mqtt_read_packet(mqtt: ssl.SSLSocket) -> tuple[int, bytes]:
     """Read one MQTT packet."""
 
-    # paho-mqtt 같은 외부 의존성을 추가하지 않기 위해 필요한 최소 MQTT v3.1.1
-    # packet framing만 직접 구현했다.
+    # Keep the dependency surface small by implementing minimal MQTT framing.
     header = mqtt.recv(1)
     if not header:
         raise RuntimeError("Refoss MQTT connection closed")
@@ -985,7 +1104,7 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 3
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(
         self,
@@ -1023,8 +1142,15 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
         if data is None:
             return None
 
-        # 내부 계산은 Wh, HA 표시는 kWh.
+        # Internal energy values are Wh; HA displays kWh.
         return round(data.net_wh / 1000, 3)
+
+    @property
+    def last_reset(self) -> datetime:
+        """Return the start of the current billing period."""
+
+        period = _billing_period(self._reading_day)
+        return datetime.fromtimestamp(period.local_start, dt_util.DEFAULT_TIME_ZONE)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1049,13 +1175,27 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
 
         attrs.update(
             {
-                "source": "cloud_mqtt_mconsume",
-                # 디버깅용 속성: MQTT 현재 월누적과 HTTP 보정값이 어떻게 합쳐졌는지
-                # UI에서 바로 확인할 수 있게 둔다.
+                "source": data.billing_source,
+                # Debug attributes make the billing calculation visible in HA.
                 "current_mconsume_kwh": round(data.current_mconsume_wh / 1000, 3),
-                "month_prefix_kwh": round(data.month_prefix_wh / 1000, 3),
-                "previous_period_kwh": round(data.previous_period_wh / 1000, 3),
+                "completed_history_kwh": round(
+                    data.completed_history_wh / 1000, 3
+                ),
+                "today_consumptionh_kwh": (
+                    round(data.today_wh / 1000, 3)
+                    if data.today_source
+                    in (
+                        "cloud_mqtt_consumptionh_total",
+                        "stale_cloud_mqtt_consumptionh_total",
+                    )
+                    else None
+                ),
+                "recent_history_adjustment_kwh": round(
+                    data.recent_history_adjustment_wh / 1000, 3
+                ),
                 "history_rows": data.history_rows,
+                "today_history_rows": data.today_history_rows,
+                "today_source": data.today_source,
             }
         )
         return {
@@ -1074,7 +1214,7 @@ class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 3
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(
         self,
@@ -1111,8 +1251,20 @@ class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
         data = (self.coordinator.data or {}).get(self._channel)
         if data is None:
             return None
+        if data.today_source not in (
+            "cloud_mqtt_consumptionh_total",
+            "stale_cloud_mqtt_consumptionh_total",
+        ):
+            return None
 
         return round(data.today_wh / 1000, 3)
+
+    @property
+    def last_reset(self) -> datetime:
+        """Return local midnight for the current day."""
+
+        now = dt_util.now()
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1125,7 +1277,7 @@ class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
             "channel_label": _channel_label(self._channel),
             "kind": "net",
             "date": now.date().isoformat(),
-            "source": "cloud_mqtt_mconsume_minus_http_daily_history",
+            "source": data.today_source if data is not None else "unknown",
         }
         if data is None:
             return attrs
@@ -1133,7 +1285,15 @@ class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
         attrs.update(
             {
                 "current_mconsume_kwh": round(data.current_mconsume_wh / 1000, 3),
-                "today_prefix_kwh": round(data.today_prefix_wh / 1000, 3),
+                "today_consumptionh_kwh": (
+                    round(data.today_wh / 1000, 3)
+                    if data.today_source
+                    in (
+                        "cloud_mqtt_consumptionh_total",
+                        "stale_cloud_mqtt_consumptionh_total",
+                    )
+                    else None
+                ),
                 "today_history_rows": data.today_history_rows,
             }
         )
@@ -1192,7 +1352,7 @@ class RefossCloudInstantSensor(CoordinatorEntity, SensorEntity):
         if data is None:
             return None
 
-        # ElectricityX 원본 단위를 HA 표시 단위로 변환한다.
+        # Convert raw ElectricityX units to HA display units.
         if self._sensor_type == "power":
             return round(data.power_mw / 1000, 3)
         if self._sensor_type == "voltage":
