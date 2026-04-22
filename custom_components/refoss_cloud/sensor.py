@@ -443,6 +443,7 @@ class RefossCloudClient:
             channel, period, history_refresh_token
         )
         today = await self._async_today_prefix(channel, history_refresh_token)
+        mconsume_today_wh = current_mconsume_wh - today.before_today_wh
 
         # Refoss mConsume은 해당 월 1일부터 현재까지의 누적값이다.
         # 검침일이 이미 지났으면: 월초~검침 전날(prefix)을 빼서 검침일 이후만 남긴다.
@@ -453,7 +454,7 @@ class RefossCloudClient:
                 - history.month_prefix_wh
                 + history.previous_period_wh
             ),
-            today_wh=current_mconsume_wh - today.before_today_wh,
+            today_wh=mconsume_today_wh,
             current_mconsume_wh=current_mconsume_wh,
             month_prefix_wh=history.month_prefix_wh,
             previous_period_wh=history.previous_period_wh,
@@ -531,7 +532,12 @@ class RefossCloudClient:
         today_start = int(
             datetime(now.year, now.month, now.day, tzinfo=UTC).timestamp()
         )
-        cache_key = (channel, month_start, today_start, history_refresh_token)
+        cache_key = (
+            channel,
+            month_start,
+            today_start,
+            history_refresh_token,
+        )
         if cache_key in self._today_cache:
             return self._today_cache[cache_key]
 
@@ -540,13 +546,21 @@ class RefossCloudClient:
             self._today_cache.pop(key, None)
 
         if today_start <= month_start:
-            today = TodayPrefix(before_today_wh=0, history_rows=0)
+            today = TodayPrefix(
+                before_today_wh=0,
+                history_rows=0,
+            )
         else:
             rows = await self._async_electric_history(
                 channel=channel,
                 start_time=month_start,
                 end_time=today_start - 1,
                 step="1d",
+            )
+            rows = _history_rows_before_cutoff(
+                rows,
+                cutoff=today_start,
+                max_rows=(today_start - month_start) // 86400,
             )
             today = TodayPrefix(
                 before_today_wh=sum(_row_net_wh(row) for row in rows),
@@ -846,6 +860,51 @@ def _row_net_wh(row: dict[str, Any]) -> int:
     valcons = int(row.get("valcons") or 0)
     valprod = int(row.get("valprod") or 0)
     return valcons + valprod
+
+
+def _history_rows_before_cutoff(
+    rows: list[dict[str, Any]], cutoff: int, max_rows: int
+) -> list[dict[str, Any]]:
+    """Return daily history rows before a timestamp cutoff."""
+
+    timestamped_rows = [
+        (timestamp, row)
+        for row in rows
+        if (timestamp := _row_timestamp(row)) is not None
+    ]
+    if timestamped_rows:
+        return [
+            row
+            for timestamp, row in sorted(timestamped_rows, key=lambda item: item[0])
+            if timestamp < cutoff
+        ]
+
+    # 일부 응답은 timestamp 없이 일별 row만 순서대로 줄 수 있다. 이때는
+    # 월초부터 어제까지 필요한 개수만 남겨 오늘 row가 prefix에 섞이지 않게 한다.
+    return rows[:max(0, max_rows)]
+
+
+def _row_timestamp(row: dict[str, Any]) -> int | None:
+    """Return a normalized seconds timestamp from one history row."""
+
+    for key in ("time", "timestamp", "timeStamp", "ts", "date"):
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            timestamp = int(value)
+            return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+        if isinstance(value, str):
+            try:
+                timestamp = int(value)
+            except ValueError:
+                try:
+                    return int(datetime.fromisoformat(value).timestamp())
+                except ValueError:
+                    continue
+            return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+
+    return None
 
 
 def _random_string(length: int) -> str:
