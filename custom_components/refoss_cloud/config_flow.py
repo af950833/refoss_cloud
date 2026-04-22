@@ -28,19 +28,14 @@ from .sensor import (
     RefossCloudClient,
 )
 
-# EM06 내부 채널 번호는 1~6이지만, 사용자에게는 실제 배선 표기인
-# A1/B1/C1/A2/B2/C2로 보여준다. 저장값은 계속 번호를 써서 unique_id가
-# 바뀌지 않게 유지한다.
 CHANNEL_OPTIONS = [
     {"value": str(channel), "label": label}
     for channel, label in CHANNEL_LABELS.items()
 ]
 
-# 검침일은 슬라이더 대신 드롭다운으로 받는다. 1~27일은 고정 날짜이고,
-# "last"는 sensor.py에서 각 월의 실제 말일로 변환된다.
 READING_DAY_OPTIONS = [
-    {"value": str(day), "label": f"{day}일"} for day in range(1, 28)
-] + [{"value": READING_DAY_LAST, "label": "말일"}]
+    {"value": str(day), "label": f"{day} day"} for day in range(1, 28)
+] + [{"value": READING_DAY_LAST, "label": "Last day"}]
 DEFAULT_SCAN_INTERVAL_SECONDS = int(DEFAULT_SCAN_INTERVAL.total_seconds())
 
 
@@ -55,7 +50,6 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.OptionsFlow:
         """Return the options flow."""
 
-        # 이미 추가한 통합도 옵션 화면에서 MQTT polling 주기를 조정할 수 있다.
         return RefossCloudOptionsFlow(config_entry)
 
     def __init__(self) -> None:
@@ -71,8 +65,6 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # 첫 단계에서는 계정 로그인 가능 여부만 확인한다. 성공하면 같은
-            # 토큰으로 기기 목록을 받아 다음 단계의 선택지로 사용한다.
             client = RefossCloudClient(
                 session=async_get_clientsession(self.hass),
                 email=user_input[CONF_EMAIL],
@@ -124,8 +116,6 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(uuid)
                 self._abort_if_unique_id_configured()
 
-                # 표시 이름은 사용자가 정할 수 있지만, 계정/기기/채널/검침일 같은
-                # 실제 동작 설정은 entry.data에 저장한다.
                 title = user_input.get(CONF_NAME) or device_options[uuid].split(" (", 1)[0]
                 return self.async_create_entry(
                     title=title,
@@ -192,8 +182,6 @@ class RefossCloudOptionsFlow(config_entries.OptionsFlow):
         """Manage Refoss Cloud options."""
 
         if user_input is not None:
-            # 옵션 변경 후에는 __init__.py의 update listener가 entry를 reload해서
-            # 새 polling 주기를 즉시 반영한다.
             return self.async_create_entry(
                 title="",
                 data={
@@ -233,15 +221,12 @@ def _parse_reading_day(value: str | int) -> int | str:
 def _parse_scan_interval(value: str | int) -> int:
     """Parse the MQTT polling interval in seconds."""
 
-    # 너무 짧은 주기로 cloud MQTT를 반복 호출하지 않도록 최소 10초를 보장한다.
     return max(10, int(value))
 
 
 def _parse_channels(value: str | list[str]) -> list[int]:
     """Parse selected channels."""
 
-    # 새 UI는 ["1", "2"] 형태를 넘기지만, 기존 텍스트 입력("1,2,3")이나
-    # 사용자가 직접 A1/B1 같은 라벨을 넣은 경우도 계속 받아준다.
     channels: list[int] = []
     parts = value if isinstance(value, list) else value.split(",")
     labels = {label.lower(): channel for channel, label in CHANNEL_LABELS.items()}
