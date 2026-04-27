@@ -1,20 +1,25 @@
-"""Refoss Cloud energy history sensors."""
+"""Refoss EM06 energy sensors with safe startup and debug logging.
+
+This version intentionally creates entities even when the local Refoss API has
+missing rows, no GETACK responses, or outage-related gaps.  Missing values are
+reported as unavailable/None instead of aborting Home Assistant platform setup.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from calendar import monthrange
-import asyncio
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import logging
+from pathlib import Path
 import random
-import socket
-import ssl
+import re
 import string
-import struct
+import subprocess
 import time
 from typing import Any
 
@@ -29,21 +34,20 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_EMAIL,
+    CONF_HOST,
     CONF_NAME,
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
     UnitOfEnergy,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
-    UpdateFailed,
 )
 from homeassistant.util import dt as dt_util
 
@@ -51,7 +55,6 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Config entry and YAML option keys.
 CONF_CHANNELS = "channels"
 CONF_READING_DAY = "reading_day"
 CONF_UUID = "uuid"
@@ -60,12 +63,14 @@ READING_DAY_LAST = "last"
 DEFAULT_NAME = "Refoss Cloud"
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=15)
 DEFAULT_API_BASE = "https://iotx.refoss.net"
-# Fixed salt used by the Refoss/Meross HTTP API signature.
 SECRET = "23x17ahWarFH6w29"
-SNAPSHOT_STORE_VERSION = 1
-SNAPSHOT_STORE_KEY = "refoss_cloud_mconsume_snapshots"
-SNAPSHOT_RETENTION_DAYS = 40
-MONTH_RESET_SNAPSHOT_MAX_WH = 50
+HISTORY_BUCKET_SHIFT = timedelta(hours=9)
+LOCAL_API_TIMEOUT = 3
+CONSUMPTIONH_BATCH_SIZE = 3
+CONSUMPTIONH_BATCH_DELAY = 0.1
+LEDGER_STORE_VERSION = 1
+LEDGER_SCHEMA_VERSION = 1
+
 SENSOR_SLUG = "billing_month_energy"
 SENSOR_LABEL = "Billing month energy"
 TODAY_SENSOR_SLUG = "this_day_energy"
@@ -80,27 +85,30 @@ CHANNEL_LABELS = {
     6: "C2",
 }
 
-# ElectricityX returns mConsume and instantaneous values in one response.
 INSTANT_SENSOR_TYPES: dict[str, dict[str, Any]] = {
     "power": {
         "label": "Power",
         "device_class": SensorDeviceClass.POWER,
         "unit": "W",
+        "precision": 1,
     },
     "voltage": {
         "label": "Voltage",
         "device_class": SensorDeviceClass.VOLTAGE,
         "unit": "V",
+        "precision": 1,
     },
     "power_factor": {
         "label": "PF",
         "device_class": None,
         "unit": None,
+        "precision": 3,
     },
     "current": {
         "label": "Current",
         "device_class": SensorDeviceClass.CURRENT,
         "unit": "A",
+        "precision": 3,
     },
 }
 
@@ -109,6 +117,7 @@ PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
         vol.Required(CONF_EMAIL): cv.string,
         vol.Required(CONF_PASSWORD): cv.string,
         vol.Required(CONF_UUID): cv.string,
+        vol.Optional(CONF_HOST, default=""): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_CHANNELS, default=[1, 2, 3, 4, 5, 6]): vol.All(
             cv.ensure_list, [vol.Coerce(int)]
@@ -122,73 +131,397 @@ PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
 
 
 @dataclass(slots=True)
+class ConsumptionRow:
+    """One ConsumptionH row."""
+
+    timestamp: int
+    local_dt: datetime
+    value_wh: int
+
+
+@dataclass(slots=True)
 class ChannelElectricity:
     """Current ElectricityX values for a Refoss channel."""
 
-    # Raw Refoss units: Wh, mA, mV, mW, and PF as a float.
-    mconsume_wh: int
-    current_ma: int
-    voltage_mv: int
-    power_mw: int
-    factor: float
+    mconsume_wh: int | None = None
+    current_ma: int | None = None
+    voltage_mv: int | None = None
+    power_mw: int | None = None
+    factor: float | None = None
 
 
 @dataclass(slots=True)
 class ChannelConsumption:
     """Recent ConsumptionH values for a Refoss channel."""
 
-    # ConsumptionH.total matches the app's current-day net energy value.
-    # data contains recent hourly-ish Wh rows used to fill missing yesterday hours.
-    today_wh: int
-    history_rows: int
-    date_totals_wh: dict[date, int]
-    date_hour_totals_wh: dict[tuple[date, int], int]
-    latest_history_date: date | None
+    raw_total_wh: int | None = None
+    rows: list[ConsumptionRow] | None = None
 
+    @property
+    def safe_rows(self) -> list[ConsumptionRow]:
+        """Return rows as a list."""
 
-@dataclass(slots=True)
-class ChannelSnapshot:
-    """Stored mConsume baseline for one channel."""
-
-    date: date
-    mconsume_wh: int
-    source: str
+        return self.rows or []
 
 
 @dataclass(slots=True)
 class ChannelData:
     """Energy and instantaneous values for a Refoss channel."""
 
-    # net_wh is the billing-period net energy shown in HA.
-    # It may be negative on channels with solar generation.
-    net_wh: int
-    today_wh: int
-    current_mconsume_wh: int
-    today_snapshot_wh: int | None
-    today_snapshot_source: str
-    completed_history_wh: int
-    history_rows: int
-    billing_source: str
-    today_source: str
-    today_history_rows: int
-    yesterday_http_rows: int
-    yesterday_filled_hours: list[int]
-    yesterday_missing_hours: list[int]
-    current_ma: int
-    voltage_mv: int
-    power_mw: int
-    factor: float
+    net_wh: int | None = None
+    today_wh: int | None = None
+    current_mconsume_wh: int | None = None
+    completed_history_wh: int | None = None
+    raw_total_wh: int | None = None
+    ledger_row_count: int = 0
+    today_row_count: int = 0
+    current_ma: int | None = None
+    voltage_mv: int | None = None
+    power_mw: int | None = None
+    factor: float | None = None
+    source: str = "none"
+    error: str | None = None
 
 
 @dataclass(slots=True)
-class CompletedDailyHistory:
-    """Cached completed daily history values for the billing period."""
+class BillingPeriod:
+    """Boundaries for the current billing period."""
 
-    total_wh: int
-    history_rows: int
-    yesterday_http_rows: int
-    yesterday_filled_hours: list[int]
-    yesterday_missing_hours: list[int]
+    local_start: int
+    end: int
+
+    @property
+    def start_date(self) -> date:
+        """Return the local date of the billing start."""
+
+        return datetime.fromtimestamp(self.local_start, dt_util.DEFAULT_TIME_ZONE).date()
+
+
+class HourlyEnergyLedger:
+    """Persistent hourly ledger used for completed billing-period rows."""
+
+    def __init__(self, hass: HomeAssistant, uuid: str) -> None:
+        self._uuid = uuid
+        self._store: Store = Store(
+            hass, LEDGER_STORE_VERSION, f"{DOMAIN}_hourly_ledger_{uuid}"
+        )
+        self._data = self._empty_data()
+
+    @property
+    def storage_key(self) -> str:
+        """Return the Home Assistant storage key."""
+
+        return f"{DOMAIN}_hourly_ledger_{self._uuid}"
+
+    def _empty_data(self) -> dict[str, Any]:
+        """Return an empty persisted ledger shape."""
+
+        return {
+            "version": LEDGER_SCHEMA_VERSION,
+            "uuid": self._uuid,
+            "rebuilt_at": None,
+            "period_start": None,
+            "updated_at": None,
+            "rows": {},
+        }
+
+    async def async_load(self) -> None:
+        """Load the ledger once during setup."""
+
+        stored = await self._store.async_load()
+        if not isinstance(stored, dict):
+            _LOGGER.debug(
+                "Refoss ledger not found or invalid; creating empty ledger: key=%s",
+                self.storage_key,
+            )
+            self._data = self._empty_data()
+            return
+
+        if stored.get("version") != LEDGER_SCHEMA_VERSION:
+            _LOGGER.warning(
+                "Refoss ledger schema mismatch; resetting ledger: key=%s stored_version=%s expected_version=%s",
+                self.storage_key,
+                stored.get("version"),
+                LEDGER_SCHEMA_VERSION,
+            )
+            self._data = self._empty_data()
+            return
+
+        self._data = stored
+        self._data.setdefault("rows", {})
+        _LOGGER.debug(
+            "Refoss ledger loaded: key=%s channels=%s row_count=%s",
+            self.storage_key,
+            list((self._data.get("rows") or {}).keys()),
+            self.total_row_count(),
+        )
+
+    async def async_rebuild(
+        self,
+        client: RefossClient,
+        channels: list[int],
+        reading_day: int | str,
+        rebuild_now: datetime,
+        current_consumption: dict[int, ChannelConsumption],
+    ) -> None:
+        """Recreate the ledger for the current billing period, then save it.
+
+        Cloud-history or local-buffer gaps are tolerated.  The file is still
+        saved so that a power-loss recovery never prevents entity creation.
+        """
+
+        period = _billing_period(reading_day, rebuild_now)
+        period_start = period.start_date
+        today = rebuild_now.date()
+        yesterday = today - timedelta(days=1)
+        new_data = self._empty_data()
+        new_data["rebuilt_at"] = rebuild_now.isoformat()
+        new_data["period_start"] = period_start.isoformat()
+
+        _LOGGER.debug(
+            "Refoss ledger rebuild started: channels=%s period_start=%s today=%s yesterday=%s",
+            channels,
+            period_start,
+            today,
+            yesterday,
+        )
+
+        if period_start <= yesterday:
+            try:
+                history_rows = await client.async_electric_history_1h_batch(
+                    channels, period_start, yesterday
+                )
+            except Exception as err:  # noqa: BLE001
+                history_rows = {channel: [] for channel in channels}
+                _LOGGER.warning(
+                    "Refoss cloud history fetch failed during ledger rebuild; continuing with local rows only: %s",
+                    err,
+                    exc_info=True,
+                )
+
+            for channel in channels:
+                accepted = 0
+                for row in history_rows.get(channel, []):
+                    row_dt = _row_local_datetime(row)
+                    if row_dt is None or not period_start <= row_dt.date() <= yesterday:
+                        continue
+                    self._add_ledger_row(
+                        new_data,
+                        channel,
+                        timestamp=int(row_dt.timestamp()),
+                        row_date=row_dt.date(),
+                        hour=row_dt.hour,
+                        value_wh=_row_net_wh(row),
+                        source="cloud_http_1h",
+                    )
+                    accepted += 1
+                _LOGGER.debug(
+                    "Refoss ledger rebuild cloud rows: channel=%s accepted=%s",
+                    channel,
+                    accepted,
+                )
+
+            # The most recent completed day can lag in HTTP history. Fill only
+            # missing yesterday hours from the local ConsumptionH buffer.
+            for channel in channels:
+                present_hours = self._hours_for_day(new_data, channel, yesterday)
+                consumption = current_consumption.get(channel)
+                if consumption is None:
+                    continue
+                filled = 0
+                for hour in range(24):
+                    if hour in present_hours:
+                        continue
+                    for item in consumption.safe_rows:
+                        if item.local_dt.date() != yesterday or item.local_dt.hour != hour:
+                            continue
+                        self._add_ledger_row(
+                            new_data,
+                            channel,
+                            timestamp=item.timestamp,
+                            row_date=item.local_dt.date(),
+                            hour=item.local_dt.hour,
+                            value_wh=item.value_wh,
+                            source="local_consumptionh_fill",
+                        )
+                        filled += 1
+                if filled:
+                    _LOGGER.debug(
+                        "Refoss ledger rebuild filled yesterday rows from local buffer: channel=%s filled=%s",
+                        channel,
+                        filled,
+                    )
+
+        # Keep today's completed rows in the file for restart recovery, but do
+        # not include today rows in completed_history calculations.
+        for channel in channels:
+            consumption = current_consumption.get(channel)
+            if consumption is None:
+                continue
+            added_today = 0
+            for item in _consumption_rows_except_latest(consumption, today):
+                self._add_ledger_row(
+                    new_data,
+                    channel,
+                    timestamp=item.timestamp,
+                    row_date=item.local_dt.date(),
+                    hour=item.local_dt.hour,
+                    value_wh=item.value_wh,
+                    source="local_consumptionh_today",
+                )
+                added_today += 1
+            if added_today:
+                _LOGGER.debug(
+                    "Refoss ledger rebuild stored today's completed local rows: channel=%s rows=%s",
+                    channel,
+                    added_today,
+                )
+
+        self._data = new_data
+        await self.async_save()
+        _LOGGER.info(
+            "Refoss ledger rebuild completed: key=%s total_rows=%s",
+            self.storage_key,
+            self.total_row_count(),
+        )
+
+    async def async_append_runtime_rows(
+        self,
+        channels: list[int],
+        period_start: date,
+        current_consumption: dict[int, ChannelConsumption],
+    ) -> None:
+        """Append the second newest ConsumptionH row from each channel."""
+
+        changed = False
+        for channel in channels:
+            consumption = current_consumption.get(channel)
+            if consumption is None or len(consumption.safe_rows) < 2:
+                continue
+            row = sorted(
+                consumption.safe_rows, key=lambda item: item.timestamp, reverse=True
+            )[1]
+            if row.local_dt.date() < period_start:
+                continue
+            if self._has_timestamp(channel, row.timestamp):
+                continue
+            self._add_ledger_row(
+                self._data,
+                channel,
+                timestamp=row.timestamp,
+                row_date=row.local_dt.date(),
+                hour=row.local_dt.hour,
+                value_wh=row.value_wh,
+                source="local_consumptionh_runtime",
+            )
+            changed = True
+            _LOGGER.debug(
+                "Refoss ledger appended runtime row: channel=%s timestamp=%s value_wh=%s",
+                channel,
+                row.timestamp,
+                row.value_wh,
+            )
+
+        if changed:
+            self._data["updated_at"] = dt_util.now().isoformat()
+            await self.async_save()
+
+    async def async_save(self) -> None:
+        """Persist the current in-memory ledger."""
+
+        try:
+            await self._store.async_save(self._data)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Refoss ledger save failed: key=%s", self.storage_key)
+            raise
+        else:
+            _LOGGER.debug(
+                "Refoss ledger saved: key=%s total_rows=%s",
+                self.storage_key,
+                self.total_row_count(),
+            )
+
+    def is_empty(self) -> bool:
+        """Return true when no rows are currently loaded."""
+
+        return not any((self._data.get("rows") or {}).values())
+
+    def total_row_count(self) -> int:
+        """Return total persisted row count."""
+
+        return sum(len(rows or {}) for rows in (self._data.get("rows") or {}).values())
+
+    def completed_sum_wh(self, channel: int, start: date, end: date) -> int:
+        """Return the saved Wh sum between two local dates, inclusive."""
+
+        if end < start:
+            return 0
+
+        total = 0
+        for row in self._channel_rows(channel).values():
+            row_date = _parse_date(row.get("date"))
+            if row_date is None or not start <= row_date <= end:
+                continue
+            total += int(row.get("value") or 0)
+        return total
+
+    def row_count(self, channel: int, start: date, end: date) -> int:
+        """Return the saved row count between two local dates, inclusive."""
+
+        if end < start:
+            return 0
+        count = 0
+        for row in self._channel_rows(channel).values():
+            row_date = _parse_date(row.get("date"))
+            if row_date is not None and start <= row_date <= end:
+                count += 1
+        return count
+
+    def _channel_rows(self, channel: int) -> dict[str, Any]:
+        """Return the row mapping for one channel."""
+
+        rows = self._data.setdefault("rows", {})
+        return rows.setdefault(str(channel), {})
+
+    def _has_timestamp(self, channel: int, timestamp: int) -> bool:
+        """Return true if the row timestamp is already in the ledger."""
+
+        return str(timestamp) in self._channel_rows(channel)
+
+    def _add_ledger_row(
+        self,
+        data: dict[str, Any],
+        channel: int,
+        timestamp: int,
+        row_date: date,
+        hour: int,
+        value_wh: int,
+        source: str,
+    ) -> None:
+        """Insert one row if its timestamp is not already present."""
+
+        rows = data.setdefault("rows", {})
+        channel_rows = rows.setdefault(str(channel), {})
+        key = str(timestamp)
+        if key in channel_rows:
+            return
+        channel_rows[key] = {
+            "timestamp": timestamp,
+            "date": row_date.isoformat(),
+            "hour": hour,
+            "value": int(value_wh),
+            "source": source,
+        }
+
+    def _hours_for_day(self, data: dict[str, Any], channel: int, day: date) -> set[int]:
+        """Return saved hour numbers for one date."""
+
+        channel_rows = data.setdefault("rows", {}).setdefault(str(channel), {})
+        hours: set[int] = set()
+        for row in channel_rows.values():
+            if row.get("date") == day.isoformat():
+                hours.add(int(row.get("hour") or 0))
+        return hours
 
 
 async def async_setup_platform(
@@ -197,7 +530,7 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: dict[str, Any] | None = None,
 ) -> None:
-    """Set up Refoss Cloud sensors from YAML."""
+    """Set up Refoss sensors from YAML."""
 
     await _async_setup_sensors(
         hass=hass,
@@ -212,7 +545,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Refoss Cloud sensors from a config entry."""
+    """Set up Refoss sensors from a config entry."""
 
     config = dict(entry.data)
     config.update(entry.options)
@@ -232,213 +565,299 @@ async def _async_setup_sensors(
     scan_interval: timedelta,
     entry: ConfigEntry | None = None,
 ) -> None:
-    """Set up Refoss Cloud sensors."""
+    """Set up Refoss sensors.
 
-    client = RefossCloudClient(
+    Important: never raise from transient local-data problems here.  Raising at
+    this stage prevents Home Assistant from creating the entities.
+    """
+
+    uuid = config[CONF_UUID]
+    name = config.get(CONF_NAME) or DEFAULT_NAME
+    channels = [int(channel) for channel in dict.fromkeys(config[CONF_CHANNELS])]
+    reading_day = _normalize_reading_day(config[CONF_READING_DAY])
+
+    _LOGGER.info(
+        "Refoss sensor setup started: uuid=%s name=%s channels=%s reading_day=%s scan_interval=%ss host=%s entry_id=%s",
+        uuid,
+        name,
+        channels,
+        reading_day,
+        int(scan_interval.total_seconds()),
+        (config.get(CONF_HOST) or "").strip() or "auto",
+        getattr(entry, "entry_id", None),
+    )
+
+    client = RefossClient(
         session=async_get_clientsession(hass),
         email=config[CONF_EMAIL],
         password=config[CONF_PASSWORD],
-        uuid=config[CONF_UUID],
+        uuid=uuid,
+        host=(config.get(CONF_HOST) or "").strip() or None,
     )
-    # Preserve order while dropping duplicate channels.
-    channels = [int(channel) for channel in dict.fromkeys(config[CONF_CHANNELS])]
-    reading_day = _normalize_reading_day(config[CONF_READING_DAY])
-    snapshot_store = MConsumeSnapshotStore(hass, config[CONF_UUID])
-    await snapshot_store.async_load()
-    polling_lock = asyncio.Lock()
 
-    # One coordinator refreshes all channels and all entity types.
-    coordinator: DataUpdateCoordinator[dict[int, ChannelData]] = DataUpdateCoordinator(
+    try:
+        host = await client.async_resolve_local_host()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Refoss local host resolution failed; entities will still be created and remain unavailable until host is reachable: %s",
+            err,
+            exc_info=True,
+        )
+    else:
+        _LOGGER.debug("Refoss local host resolved: uuid=%s host=%s", uuid, host)
+
+    polling_lock = asyncio.Lock()
+    ledger = HourlyEnergyLedger(hass, uuid)
+    await ledger.async_load()
+
+    # Force the .storage file to be created even when there are no data rows yet.
+    try:
+        await ledger.async_save()
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning(
+            "Refoss empty ledger file could not be saved during setup; continuing so entities can be created",
+            exc_info=True,
+        )
+
+    rebuild_now = dt_util.now()
+    try:
+        _electricity, bootstrap_consumption = await client.async_current_snapshot(channels)
+        await ledger.async_rebuild(
+            client, channels, reading_day, rebuild_now, bootstrap_consumption
+        )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Refoss ledger bootstrap failed; entities will still be created. Existing/empty ledger will be used: %s",
+            err,
+            exc_info=True,
+        )
+        try:
+            await ledger.async_save()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Refoss ledger save after bootstrap failure also failed", exc_info=True)
+
+    coordinator: DataUpdateCoordinator[dict[int, ChannelData]]
+    coordinator = DataUpdateCoordinator(
         hass,
         logger=_LOGGER,
-        name=f"{DOMAIN}_{config[CONF_UUID]}",
+        name=f"{DOMAIN}_{uuid}",
         update_interval=scan_interval,
         update_method=lambda: _async_update_data(
-            client, channels, reading_day, snapshot_store, polling_lock
+            client,
+            ledger,
+            channels,
+            reading_day,
+            polling_lock,
         ),
     )
-    remove_midnight_refresh = async_track_time_change(
-        hass,
-        lambda now: hass.add_job(
-            _async_create_midnight_snapshots(
-                coordinator,
-                client,
-                channels,
-                snapshot_store,
-                scan_interval,
-                polling_lock,
-            )
-        ),
-        hour=0,
-        minute=0,
-        second=0,
-    )
-    if entry is not None:
-        entry.async_on_unload(remove_midnight_refresh)
 
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:  # noqa: BLE001
+        # This should be rare because _async_update_data also returns safe empty
+        # data.  Keep it as a final guard so entity creation never aborts.
+        _LOGGER.warning(
+            "Refoss first refresh failed; creating entities with unavailable state: %s",
+            err,
+            exc_info=True,
+        )
+        coordinator.data = _empty_channel_data(channels, f"first_refresh_failed: {err}")
 
     entities: list[SensorEntity] = []
     for channel in channels:
-        # Billing-period net energy.
+        # Keep creation grouped by channel: billing energy, today energy, then instant sensors.
         entities.append(
-            RefossCloudEnergySensor(
+            RefossEnergySensor(
                 coordinator=coordinator,
-                name=config[CONF_NAME],
-                uuid=config[CONF_UUID],
+                name=name,
+                uuid=uuid,
                 channel=channel,
                 reading_day=reading_day,
             )
         )
-        # Current-day net energy from mConsume minus the stored daily snapshot.
         entities.append(
-            RefossCloudTodayEnergySensor(
+            RefossTodayEnergySensor(
                 coordinator=coordinator,
-                name=config[CONF_NAME],
-                uuid=config[CONF_UUID],
+                name=name,
+                uuid=uuid,
                 channel=channel,
             )
         )
-        # Instantaneous values shown by the app.
         for sensor_type in INSTANT_SENSOR_TYPES:
             entities.append(
-                RefossCloudInstantSensor(
+                RefossInstantSensor(
                     coordinator=coordinator,
-                    name=config[CONF_NAME],
-                    uuid=config[CONF_UUID],
+                    name=name,
+                    uuid=uuid,
                     channel=channel,
                     sensor_type=sensor_type,
                 )
             )
 
+    _LOGGER.debug(
+        "Refoss entity creation order: %s",
+        [getattr(entity, "_attr_name", None) for entity in entities],
+    )
     async_add_entities(entities)
+    _LOGGER.info(
+        "Refoss sensor setup completed: uuid=%s entities=%s ledger_key=%s ledger_rows=%s",
+        uuid,
+        len(entities),
+        ledger.storage_key,
+        ledger.total_row_count(),
+    )
 
 
 async def _async_update_data(
-    client: RefossCloudClient,
+    client: RefossClient,
+    ledger: HourlyEnergyLedger,
     channels: list[int],
     reading_day: int | str,
-    snapshot_store: MConsumeSnapshotStore,
     polling_lock: asyncio.Lock,
 ) -> dict[int, ChannelData]:
-    """Fetch one billing-period snapshot for all configured channels."""
+    """Fetch one update for all configured channels."""
 
     async with polling_lock:
-        return await _async_update_data_locked(
-            client, channels, reading_day, snapshot_store
-        )
+        now = dt_util.now()
+        period = _billing_period(reading_day, now)
+        today = now.date()
+        yesterday = today - timedelta(days=1)
 
-
-async def _async_update_data_locked(
-    client: RefossCloudClient,
-    channels: list[int],
-    reading_day: int | str,
-    snapshot_store: MConsumeSnapshotStore,
-) -> dict[int, ChannelData]:
-    """Fetch one billing-period snapshot while polling is locked."""
-
-    try:
-        period = _billing_period(reading_day)
-        # Reuse HTTP daily history except around midnight and 00:05.
-        history_refresh_token = _history_refresh_token()
-        # Live mConsume and instantaneous values come from ElectricityX.
-        current_electricity = await client.async_current_electricity()
         try:
-            current_consumption = await client.async_cached_consumption_history(
-                channels, history_refresh_token
+            current_electricity, current_consumption = await client.async_current_snapshot(
+                channels
             )
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Refoss cached ConsumptionH update failed: %s", err)
-            current_consumption = {}
-        current_snapshots = await snapshot_store.async_get_today_snapshots(
-            current_electricity, channels, current_consumption
-        )
+            _LOGGER.warning(
+                "Refoss update failed before data parse; returning unavailable values: %s",
+                err,
+                exc_info=True,
+            )
+            return _empty_channel_data(channels, f"update_failed: {err}")
+
+        try:
+            await ledger.async_append_runtime_rows(
+                channels, period.start_date, current_consumption
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Refoss runtime ledger append failed; sensor values will continue without this row: %s",
+                err,
+                exc_info=True,
+            )
+
         data: dict[int, ChannelData] = {}
         for channel in channels:
-            data[channel] = await client.async_billing_period_energy(
-                channel,
-                period,
-                current_electricity,
-                current_snapshots,
-                current_consumption,
-                history_refresh_token,
+            electricity = current_electricity.get(channel)
+            consumption = current_consumption.get(channel)
+            errors: list[str] = []
+
+            if electricity is None:
+                errors.append("ElectricityX missing")
+                electricity = ChannelElectricity()
+            if consumption is None:
+                errors.append("ConsumptionH missing")
+                consumption = ChannelConsumption(raw_total_wh=None, rows=[])
+
+            today_wh = _consumption_day_sum(consumption, today)
+            completed_wh = ledger.completed_sum_wh(channel, period.start_date, yesterday)
+            today_row_count = sum(
+                1 for row in consumption.safe_rows if row.local_dt.date() == today
             )
+            ledger_row_count = ledger.row_count(channel, period.start_date, yesterday)
+
+            # Month/today energy can be calculated only when local ConsumptionH
+            # has at least one current-day row or ledger has completed rows.
+            energy_available = bool(today_row_count or ledger_row_count)
+            net_wh = completed_wh + today_wh if energy_available else None
+
+            data[channel] = ChannelData(
+                net_wh=net_wh,
+                today_wh=today_wh if today_row_count else None,
+                current_mconsume_wh=electricity.mconsume_wh,
+                completed_history_wh=completed_wh,
+                raw_total_wh=consumption.raw_total_wh,
+                ledger_row_count=ledger_row_count,
+                today_row_count=today_row_count,
+                current_ma=electricity.current_ma,
+                voltage_mv=electricity.voltage_mv,
+                power_mw=electricity.power_mw,
+                factor=electricity.factor,
+                source="ledger_plus_local_consumptionh_data"
+                if energy_available
+                else "no_current_consumption_rows",
+                error="; ".join(errors) if errors else None,
+            )
+
+            _LOGGER.debug(
+                "Refoss channel update: channel=%s net_wh=%s today_wh=%s ledger_rows=%s today_rows=%s mconsume=%s power_mw=%s voltage_mv=%s current_ma=%s error=%s",
+                channel,
+                data[channel].net_wh,
+                data[channel].today_wh,
+                ledger_row_count,
+                today_row_count,
+                data[channel].current_mconsume_wh,
+                data[channel].power_mw,
+                data[channel].voltage_mv,
+                data[channel].current_ma,
+                data[channel].error,
+            )
+
         return data
-    except Exception as err:  # noqa: BLE001
-        raise UpdateFailed(str(err)) from err
 
 
-async def _async_create_midnight_snapshots(
-    coordinator: DataUpdateCoordinator[dict[int, ChannelData]],
-    client: RefossCloudClient,
-    channels: list[int],
-    snapshot_store: MConsumeSnapshotStore,
-    scan_interval: timedelta,
-    polling_lock: asyncio.Lock,
-) -> None:
-    """Pause periodic polling briefly and create exact midnight snapshots."""
+def _consumptionh_channel_batches(channels: list[int]) -> list[list[int]]:
+    """Return ConsumptionH channel batches in A1/B1/C1 then A2/B2/C2 order.
 
-    async with polling_lock:
-        coordinator.update_interval = None
-        try:
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    current_electricity = await client.async_current_electricity()
-                    await snapshot_store.async_get_today_snapshots(
-                        current_electricity,
-                        channels,
-                        {},
-                        backfill_from_consumption=False,
-                        replace_backfilled_snapshot=True,
-                    )
-                    break
-                except Exception as err:  # noqa: BLE001
-                    if attempt >= max_attempts - 1:
-                        raise
-                    _LOGGER.debug(
-                        "Refoss midnight mConsume snapshot failed, retrying attempt %s/%s: %s",
-                        attempt + 2,
-                        max_attempts,
-                        err,
-                    )
-                    await asyncio.sleep(2)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Refoss midnight mConsume snapshot failed: %s", err)
-        finally:
-            coordinator.update_interval = scan_interval
+    Refoss EM06 channel labels are mapped as 1=A1, 2=B1, 3=C1,
+    4=A2, 5=B2, and 6=C2. Keeping the first group separate from the
+    second group lowers the local API's concurrent request pressure while
+    preserving the preferred electrical phase/order.
+    """
 
-    await coordinator.async_request_refresh()
+    batches: list[list[int]] = []
+    seen: set[int] = set()
 
-@dataclass(slots=True)
-class BillingPeriod:
-    """Timestamp boundaries for the current billing period."""
+    for preferred_group in ([1, 2, 3], [4, 5, 6]):
+        batch = [
+            channel
+            for channel in preferred_group
+            if channel in channels and channel not in seen
+        ]
+        if batch:
+            batches.append(batch)
+            seen.update(batch)
 
-    local_start: int
-    end: int
+    remaining = [channel for channel in channels if channel not in seen]
+    for index in range(0, len(remaining), CONSUMPTIONH_BATCH_SIZE):
+        batches.append(remaining[index : index + CONSUMPTIONH_BATCH_SIZE])
+
+    return batches
 
 
-def _billing_period(reading_day: int | str) -> BillingPeriod:
+def _empty_channel_data(channels: list[int], error: str) -> dict[int, ChannelData]:
+    """Return unavailable placeholder data for all channels."""
+
+    return {
+        channel: ChannelData(source="unavailable", error=error) for channel in channels
+    }
+
+
+def _billing_period(
+    reading_day: int | str, now: datetime | None = None
+) -> BillingPeriod:
     """Return local timestamp boundaries for the current billing period."""
 
-    now = dt_util.now()
-
-    # "last" means the actual last day of each month.
+    now = now or dt_util.now()
     day_this_month = _reading_day_for_month(reading_day, now.year, now.month)
-    local_start = datetime(
-        now.year, now.month, day_this_month, tzinfo=now.tzinfo
-    )
+    local_start = datetime(now.year, now.month, day_this_month, tzinfo=now.tzinfo)
     if now < local_start:
-        # Before this month's reading day, the billing period started last month.
         prev_month = now.month - 1 or 12
         prev_year = now.year if now.month > 1 else now.year - 1
         prev_day = _reading_day_for_month(reading_day, prev_year, prev_month)
         local_start = datetime(prev_year, prev_month, prev_day, tzinfo=now.tzinfo)
 
-    return BillingPeriod(
-        local_start=int(local_start.timestamp()),
-        end=int(now.timestamp()),
-    )
+    return BillingPeriod(local_start=int(local_start.timestamp()), end=int(now.timestamp()))
 
 
 def _normalize_reading_day(value: Any) -> int | str:
@@ -446,24 +865,20 @@ def _normalize_reading_day(value: Any) -> int | str:
 
     if value == READING_DAY_LAST:
         return READING_DAY_LAST
-
     day = int(value)
-    # Older configs may have stored 28-31; treat them as "last day".
     if day >= 28:
         return READING_DAY_LAST
     return day
 
 
 def _scan_interval_from_config(config: dict[str, Any]) -> timedelta:
-    """Return the configured MQTT polling interval."""
+    """Return the configured polling interval."""
 
     value = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    # Config flow stores seconds, while YAML may already pass a timedelta.
     if isinstance(value, timedelta):
         seconds = int(value.total_seconds())
     else:
         seconds = int(value)
-
     return timedelta(seconds=max(10, seconds))
 
 
@@ -472,234 +887,11 @@ def _reading_day_for_month(reading_day: int | str, year: int, month: int) -> int
 
     if reading_day == READING_DAY_LAST:
         return monthrange(year, month)[1]
-
     return min(int(reading_day), monthrange(year, month)[1])
 
 
-def _history_refresh_token() -> str:
-    """Return the current daily history refresh bucket.
-
-    MQTT values are refreshed every coordinator update. HTTP history is only
-    needed for past daily correction, so refresh it once after local midnight
-    and again after five minutes to catch delayed daily rows.
-    """
-
-    now = dt_util.now()
-    midnight_retry = now.replace(hour=0, minute=5, second=0, microsecond=0)
-    midnight_first = now.replace(hour=0, minute=0, second=5, microsecond=0)
-
-    # Avoid caching incomplete daily history immediately after midnight.
-    if now >= midnight_retry:
-        date = now.date().isoformat()
-        bucket = "0005"
-    elif now >= midnight_first:
-        date = now.date().isoformat()
-        bucket = "0000"
-    else:
-        date = (now - timedelta(days=1)).date().isoformat()
-        bucket = "0005"
-
-    return f"{date}:{bucket}"
-
-
-def _midnight_backfill_guard_active(now: datetime) -> bool:
-    """Return true while ConsumptionH may still be cached from yesterday.
-
-    If the exact 00:00 snapshot fails, the first coordinator refresh can happen
-    before the history refresh bucket rolls over at 00:00:05. In that narrow
-    window, a missing snapshot must not be reconstructed from stale
-    ConsumptionH data from the previous day.
-    """
-
-    return now.hour == 0 and now.minute == 0 and now.second < 5
-
-
-def _month_reset_guard_active(now: datetime) -> bool:
-    """Return true during the EM06 first-day reset guard window."""
-
-    last_day = monthrange(now.year, now.month)[1]
-    return (
-        (now.day == last_day and now.hour == 23 and now.minute >= 50)
-        or (now.day == 1 and now.hour == 0 and now.minute <= 10)
-    )
-
-
-def _month_reset_zero_snapshot_active(now: datetime) -> bool:
-    """Return true when first-day near-zero mConsume values should become zero."""
-
-    return now.day == 1 and now.hour == 0 and now.minute <= 10
-
-
-def _set_snapshot_if_changed(
-    snapshot_data: dict[str, Any], key: str, entry: dict[str, Any]
-) -> bool:
-    """Set a persisted snapshot entry and return whether it changed."""
-
-    if snapshot_data.get(key) == entry:
-        return False
-    snapshot_data[key] = entry
-    return True
-
-
-def _snapshot_entry(value: int, source: str) -> dict[str, Any]:
-    """Build one persisted mConsume snapshot entry."""
-
-    return {"mconsume_wh": int(value), "source": source}
-
-
-def _snapshot_entry_value(entry: Any) -> tuple[int, str] | None:
-    """Read a snapshot entry, including entries from older versions."""
-
-    if isinstance(entry, dict):
-        try:
-            value = int(entry["mconsume_wh"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        return value, str(entry.get("source") or "mconsume_snapshot")
-
-    try:
-        return int(entry), "mconsume_snapshot"
-    except (TypeError, ValueError):
-        return None
-
-
-def _prune_old_snapshots(device_data: dict[str, Any], today: date) -> bool:
-    """Remove daily snapshots older than the retention window."""
-
-    cutoff = today - timedelta(days=SNAPSHOT_RETENTION_DAYS)
-    changed = False
-    for date_key in list(device_data):
-        try:
-            snapshot_date = date.fromisoformat(date_key)
-        except ValueError:
-            continue
-        if snapshot_date < cutoff:
-            device_data.pop(date_key, None)
-            changed = True
-    return changed
-
-
-def _stored_snapshot(
-    device_data: dict[str, Any],
-    snapshot_date: date,
-    channel: int,
-) -> ChannelSnapshot | None:
-    """Return one stored daily mConsume snapshot."""
-
-    day_data = device_data.get(snapshot_date.isoformat())
-    if not isinstance(day_data, dict):
-        return None
-    entry = _snapshot_entry_value(day_data.get(str(channel)))
-    if entry is None:
-        return None
-    value, source = entry
-    return ChannelSnapshot(snapshot_date, value, source)
-
-
-class MConsumeSnapshotStore:
-    """Persist daily mConsume baselines used for current-day energy."""
-
-    def __init__(self, hass: HomeAssistant, uuid: str) -> None:
-        self._store: Store[dict[str, Any]] = Store(
-            hass, SNAPSHOT_STORE_VERSION, SNAPSHOT_STORE_KEY
-        )
-        self._uuid = uuid
-        self._data: dict[str, Any] = {"devices": {}}
-        self._lock = asyncio.Lock()
-
-    async def async_load(self) -> None:
-        """Load stored snapshots."""
-
-        stored = await self._store.async_load()
-        if isinstance(stored, dict):
-            self._data = stored
-        self._data.setdefault("devices", {}).setdefault(self._uuid, {})
-
-    async def async_get_today_snapshots(
-        self,
-        current_electricity: dict[int, ChannelElectricity],
-        channels: list[int],
-        current_consumption: dict[int, ChannelConsumption],
-        backfill_from_consumption: bool = True,
-        replace_backfilled_snapshot: bool = False,
-    ) -> dict[int, ChannelSnapshot]:
-        """Return today's baseline snapshots, creating missing rows if needed."""
-
-        async with self._lock:
-            now = dt_util.now()
-            today = now.date()
-            date_key = today.isoformat()
-            device_data = self._data.setdefault("devices", {}).setdefault(
-                self._uuid, {}
-            )
-            day_data: dict[str, Any] = device_data.setdefault(date_key, {})
-
-            midnight_backfill_guard = _midnight_backfill_guard_active(now)
-            reset_guard_active = _month_reset_guard_active(now)
-            zero_snapshot_active = _month_reset_zero_snapshot_active(now)
-            changed = _prune_old_snapshots(device_data, today)
-
-            for channel in channels:
-                if channel not in current_electricity:
-                    continue
-                key = str(channel)
-                current_mconsume_wh = current_electricity[channel].mconsume_wh
-                if reset_guard_active:
-                    if (
-                        zero_snapshot_active
-                        and 0 <= current_mconsume_wh <= MONTH_RESET_SNAPSHOT_MAX_WH
-                    ):
-                        zero_entry = _snapshot_entry(
-                            0,
-                            "month_reset_zero_snapshot",
-                        )
-                        if _set_snapshot_if_changed(day_data, key, zero_entry):
-                            changed = True
-                    continue
-                existing = _snapshot_entry_value(day_data.get(key))
-                if (
-                    replace_backfilled_snapshot
-                    and existing is not None
-                    and existing[1] == "mconsume_snapshot_backfilled_from_consumptionh"
-                ):
-                    day_data[key] = _snapshot_entry(
-                        current_mconsume_wh, "mconsume_snapshot"
-                    )
-                    changed = True
-                    continue
-                if key not in day_data:
-                    consumption = current_consumption.get(channel)
-                    if backfill_from_consumption and midnight_backfill_guard:
-                        continue
-                    if backfill_from_consumption and consumption is not None:
-                        day_data[key] = _snapshot_entry(
-                            current_mconsume_wh - consumption.today_wh,
-                            "mconsume_snapshot_backfilled_from_consumptionh",
-                        )
-                    else:
-                        day_data[key] = _snapshot_entry(
-                            current_mconsume_wh, "mconsume_snapshot"
-                        )
-                    changed = True
-
-            if changed:
-                await self._store.async_save(self._data)
-
-            result: dict[int, ChannelSnapshot] = {}
-            for channel in channels:
-                snapshot = _snapshot_entry_value(day_data.get(str(channel)))
-                if snapshot is None:
-                    continue
-                value, source = snapshot
-                result[channel] = ChannelSnapshot(
-                    date=today,
-                    mconsume_wh=value,
-                    source=source,
-                )
-            return result
-
-class RefossCloudClient:
-    """Small client for the Refoss/Meross cloud HTTP API."""
+class RefossClient:
+    """Small client for Refoss cloud history and local EM06 control APIs."""
 
     def __init__(
         self,
@@ -707,245 +899,358 @@ class RefossCloudClient:
         email: str,
         password: str,
         uuid: str,
+        host: str | None = None,
     ) -> None:
         self._session = session
         self._email = email
         self._password = password
         self._uuid = uuid
+        self._host = host
         self._token: str | None = None
-        self._userid: str | None = None
         self._key: str | None = None
-        self._mqtt_domain: str | None = None
         self._api_base = DEFAULT_API_BASE
-        self._history_cache: dict[
-            tuple[int, int, str], CompletedDailyHistory
-        ] = {}
-        self._consumption_cache: dict[
-            tuple[tuple[int, ...], str], dict[int, ChannelConsumption]
-        ] = {}
-        self._mqtt_lock = asyncio.Lock()
+        self._login_lock = asyncio.Lock()
 
-    async def async_billing_period_energy(
-        self,
-        channel: int,
-        period: BillingPeriod,
-        current_electricity: dict[int, ChannelElectricity],
-        current_snapshots: dict[int, ChannelSnapshot],
-        current_consumption: dict[int, ChannelConsumption],
-        history_refresh_token: str,
-    ) -> ChannelData:
-        """Fetch electric history for one billing-period channel."""
+    async def async_resolve_local_host(self) -> str:
+        """Resolve or return the configured local API host."""
 
-        snapshot = current_electricity[channel]
-        current_mconsume_wh = snapshot.mconsume_wh
-        today = dt_util.now().date()
-        snapshot_baseline = current_snapshots.get(channel)
-        if snapshot_baseline is not None and snapshot_baseline.date == today:
-            today_wh = current_mconsume_wh - snapshot_baseline.mconsume_wh
-            today_snapshot_wh = snapshot_baseline.mconsume_wh
-            today_snapshot_source = snapshot_baseline.source
-            today_source = "cloud_mqtt_mconsume_minus_midnight_snapshot"
+        if self._host:
+            return self._host
+
+        host = await asyncio.to_thread(_find_host_by_uuid_mac, self._uuid)
+        if host:
+            self._host = host
+            return host
+
+        raise RuntimeError(
+            "Refoss local host is not configured and could not be found in ARP"
+        )
+
+    async def async_ensure_login(self, reason: str = "unspecified") -> None:
+        """Ensure cloud token/key are available before local API signing."""
+
+        if self._token and self._key:
+            return
+
+        async with self._login_lock:
+            if self._token and self._key:
+                return
+
+            _LOGGER.debug(
+                "Refoss cloud login required before local request: reason=%s uuid=%s token_present=%s key_present=%s",
+                reason,
+                self._uuid,
+                self._token is not None,
+                self._key is not None,
+            )
+            await self.async_login()
+
+    async def async_refresh_login(self, reason: str = "unspecified") -> None:
+        """Refresh cloud token/key after local sign failures."""
+
+        async with self._login_lock:
+            _LOGGER.warning(
+                "Refoss refreshing cloud login/key: reason=%s uuid=%s",
+                reason,
+                self._uuid,
+            )
+            self._token = None
+            self._key = None
+            await self.async_login()
+
+    async def async_current_snapshot(
+        self, channels: list[int]
+    ) -> tuple[dict[int, ChannelElectricity], dict[int, ChannelConsumption]]:
+        """Fetch ElectricityX and ConsumptionH through the local /public API.
+
+        Local Refoss devices sometimes return no GETACK right after a power
+        interruption.  This method gathers requests independently and returns
+        partial data instead of raising for every missing channel.
+        """
+
+        host = await self.async_resolve_local_host()
+        try:
+            await self.async_ensure_login("local_snapshot")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Refoss cloud login/key preparation failed before local snapshot; local requests may return sign error: %s",
+                err,
+                exc_info=True,
+            )
+        _LOGGER.debug(
+            "Refoss local snapshot started: host=%s uuid=%s channels=%s key_present=%s",
+            host,
+            self._uuid,
+            channels,
+            self._key is not None,
+        )
+
+        electricity: dict[int, ChannelElectricity] = {}
+        consumption: dict[int, ChannelConsumption] = {}
+
+        try:
+            electricity_response = await self._async_local_get(
+                host,
+                "Appliance.Control.ElectricityX",
+                {"electricity": [{"channel": 65535}]},
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Refoss local ElectricityX request failed; instantaneous sensors may be unavailable: %s",
+                err,
+                exc_info=True,
+            )
         else:
-            today_wh = 0
-            today_snapshot_wh = None
-            today_snapshot_source = "missing_midnight_snapshot"
-            today_source = "unavailable_midnight_snapshot"
-
-        today_consumption = current_consumption.get(channel)
-        today_history_rows = (
-            today_consumption.history_rows if today_consumption is not None else 0
-        )
-
-        history = await self._async_completed_billing_history(
-            channel, period, history_refresh_token, today_consumption
-        )
-        billing_source = (
-            "cloud_http_1d_until_two_days_ago_plus_http_1h_yesterday"
-            "_with_consumptionh_fill_plus_mconsume_today"
-        )
-        if snapshot_baseline is None:
-            billing_source += "_midnight_snapshot_unavailable"
-
-        return ChannelData(
-            net_wh=history.total_wh + today_wh,
-            today_wh=today_wh,
-            current_mconsume_wh=current_mconsume_wh,
-            today_snapshot_wh=today_snapshot_wh,
-            today_snapshot_source=today_snapshot_source,
-            completed_history_wh=history.total_wh,
-            history_rows=history.history_rows,
-            billing_source=billing_source,
-            today_source=today_source,
-            today_history_rows=today_history_rows,
-            yesterday_http_rows=history.yesterday_http_rows,
-            yesterday_filled_hours=history.yesterday_filled_hours,
-            yesterday_missing_hours=history.yesterday_missing_hours,
-            current_ma=snapshot.current_ma,
-            voltage_mv=snapshot.voltage_mv,
-            power_mw=snapshot.power_mw,
-            factor=snapshot.factor,
-        )
-
-    async def _async_completed_billing_history(
-        self,
-        channel: int,
-        period: BillingPeriod,
-        history_refresh_token: str,
-        current_consumption: ChannelConsumption | None,
-    ) -> CompletedDailyHistory:
-        """Return cached usage from billing start through yesterday."""
-
-        cache_key = (channel, period.local_start, history_refresh_token)
-        if cache_key in self._history_cache:
-            return self._history_cache[cache_key]
-
-        stale_keys = [key for key in self._history_cache if key[0] == channel]
-        for key in stale_keys:
-            self._history_cache.pop(key, None)
-
-        now = dt_util.now()
-        today = now.date()
-        yesterday = today - timedelta(days=1)
-        two_days_ago = today - timedelta(days=2)
-        period_start_date = datetime.fromtimestamp(
-            period.local_start, dt_util.DEFAULT_TIME_ZONE
-        ).date()
-
-        total_wh = 0
-        daily_rows: list[dict[str, Any]] = []
-        if period_start_date <= two_days_ago:
-            daily_rows = await self._async_electric_history(
-                channel=channel,
-                start_time=_local_day_start_timestamp(period_start_date),
-                end_time=_local_day_end_timestamp(two_days_ago),
-                step="1d",
+            rows = electricity_response.get("payload", {}).get("electricity", [])
+            electricity = _parse_electricity_rows(rows)
+            _LOGGER.debug(
+                "Refoss local ElectricityX parsed: requested=%s received_channels=%s row_count=%s",
+                channels,
+                sorted(electricity),
+                len(rows or []),
             )
-            total_wh += sum(_row_net_wh(row) for row in daily_rows)
 
-        yesterday_hourly: dict[int, int] = {}
-        yesterday_rows: list[dict[str, Any]] = []
-        if period_start_date <= yesterday:
-            yesterday_rows = await self._async_electric_history(
-                channel=channel,
-                start_time=_local_day_start_timestamp(yesterday),
-                end_time=_local_day_end_timestamp(yesterday),
-                step="1h",
+        consumption_batches = _consumptionh_channel_batches(channels)
+        for batch_index, channel_batch in enumerate(consumption_batches, start=1):
+            _LOGGER.debug(
+                "Refoss local ConsumptionH batch started: batch=%s/%s channels=%s",
+                batch_index,
+                len(consumption_batches),
+                channel_batch,
             )
-            for row in yesterday_rows:
-                row_dt = _row_local_datetime(row)
-                if row_dt is None or row_dt.date() != yesterday:
-                    continue
-                yesterday_hourly[row_dt.hour] = (
-                    yesterday_hourly.get(row_dt.hour, 0) + _row_net_wh(row)
+            tasks = [
+                self._async_local_get(
+                    host,
+                    "Appliance.Control.ConsumptionH",
+                    {"consumptionH": [{"channel": channel}]},
                 )
-
-        filled_hours: list[int] = []
-        missing_hours: list[int] = []
-        if period_start_date <= yesterday:
-            for hour in range(24):
-                if hour in yesterday_hourly:
-                    continue
-                fill_value = (
-                    current_consumption.date_hour_totals_wh.get((yesterday, hour))
-                    if current_consumption is not None
-                    else None
-                )
-                if fill_value is None:
-                    missing_hours.append(hour)
-                    continue
-                yesterday_hourly[hour] = fill_value
-                filled_hours.append(hour)
-            total_wh += sum(yesterday_hourly.values())
-
-        history = CompletedDailyHistory(
-            total_wh=total_wh,
-            history_rows=len(daily_rows) + len(yesterday_rows),
-            yesterday_http_rows=len(yesterday_rows),
-            yesterday_filled_hours=filled_hours,
-            yesterday_missing_hours=missing_hours,
-        )
-        if not missing_hours or current_consumption is not None:
-            self._history_cache[cache_key] = history
-        return history
-
-    async def async_current_electricity(
-        self, max_attempts: int = 3
-    ) -> dict[int, ChannelElectricity]:
-        """Fetch current ElectricityX values through Refoss cloud MQTT."""
-
-        if self._token is None:
-            await self.async_login()
-
-        # Socket MQTT is blocking I/O, so run it in a worker thread.
-        last_err: OSError | TimeoutError | None = None
-        async with self._mqtt_lock:
-            for attempt in range(max_attempts):
-                try:
-                    return await asyncio.to_thread(self._mqtt_current_electricity)
-                except (OSError, TimeoutError, RuntimeError) as err:
-                    last_err = err
-                    if attempt < max_attempts - 1:
-                        # Retry transient DNS, network, or MQTT response delays.
-                        _LOGGER.debug(
-                            "Refoss MQTT update failed, retrying attempt %s/%s: %s",
-                            attempt + 2,
-                            max_attempts,
-                            err,
-                        )
-                        await asyncio.sleep(2)
-
-        if last_err is not None:
-            raise last_err
-        raise RuntimeError("Refoss MQTT ElectricityX response failed")
-
-    async def async_current_consumption(
-        self, channels: list[int], max_attempts: int = 3
-    ) -> dict[int, ChannelConsumption]:
-        """Fetch current-day ConsumptionH values through Refoss cloud MQTT."""
-
-        if self._token is None:
-            await self.async_login()
-
-        last_err: OSError | TimeoutError | RuntimeError | None = None
-        async with self._mqtt_lock:
-            for attempt in range(max_attempts):
-                try:
-                    return await asyncio.to_thread(
-                        self._mqtt_current_consumption, channels
+                for channel in channel_batch
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for channel, response in zip(channel_batch, responses, strict=True):
+                if isinstance(response, Exception):
+                    _LOGGER.warning(
+                        "Refoss local ConsumptionH request failed for channel %s; this channel may be unavailable: %s",
+                        channel,
+                        response,
+                        exc_info=response,
                     )
-                except (OSError, TimeoutError, RuntimeError) as err:
-                    last_err = err
-                    if attempt < max_attempts - 1:
-                        _LOGGER.debug(
-                            "Refoss ConsumptionH update failed, retrying attempt %s/%s: %s",
-                            attempt + 2,
-                            max_attempts,
-                            err,
+                    continue
+                parsed = _parse_consumption_rows(
+                    response.get("payload", {}).get("consumptionH", [])
+                )
+                if channel not in parsed:
+                    _LOGGER.warning(
+                        "Refoss local ConsumptionH returned no parsable data for channel %s",
+                        channel,
+                    )
+                consumption.update(parsed)
+
+            _LOGGER.debug(
+                "Refoss local ConsumptionH batch completed: batch=%s/%s channels=%s parsed_channels=%s",
+                batch_index,
+                len(consumption_batches),
+                channel_batch,
+                sorted(channel for channel in channel_batch if channel in consumption),
+            )
+            if batch_index < len(consumption_batches):
+                await asyncio.sleep(CONSUMPTIONH_BATCH_DELAY)
+
+        for channel in channels:
+            if channel not in electricity:
+                _LOGGER.debug("Refoss ElectricityX missing for channel %s", channel)
+            if channel not in consumption:
+                _LOGGER.debug("Refoss ConsumptionH missing for channel %s", channel)
+
+        _LOGGER.debug(
+            "Refoss local snapshot completed: electricity_channels=%s consumption_channels=%s",
+            sorted(electricity),
+            sorted(consumption),
+        )
+        return electricity, consumption
+
+    async def async_electric_history_1h_batch(
+        self, channels: list[int], start_day: date, end_day: date
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Fetch cloud HTTP 1h history for all channels."""
+
+        if end_day < start_day:
+            return {channel: [] for channel in channels}
+
+        start_time = _cloud_history_day_start_timestamp(start_day)
+        end_time = _cloud_history_day_end_timestamp(end_day)
+        _LOGGER.debug(
+            "Refoss cloud history batch started: channels=%s start_day=%s end_day=%s start_time=%s end_time=%s",
+            channels,
+            start_day,
+            end_day,
+            start_time,
+            end_time,
+        )
+        responses = await asyncio.gather(
+            *[
+                self._async_electric_history(channel, start_time, end_time, "1h")
+                for channel in channels
+            ],
+            return_exceptions=True,
+        )
+        result: dict[int, list[dict[str, Any]]] = {}
+        for channel, response in zip(channels, responses, strict=True):
+            if isinstance(response, Exception):
+                _LOGGER.warning(
+                    "Refoss cloud history fetch failed for channel %s: %s",
+                    channel,
+                    response,
+                    exc_info=response,
+                )
+                result[channel] = []
+            else:
+                result[channel] = response
+                _LOGGER.debug(
+                    "Refoss cloud history rows received: channel=%s rows=%s",
+                    channel,
+                    len(response),
+                )
+        return result
+
+    async def _async_local_get(
+        self, host: str, namespace: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Send one local /public GET request.
+
+        The local EM06 API validates the request signature with the cloud login
+        key. After a device reboot or power outage, requests signed without a
+        fresh key can return ERROR 5001 / sign error. Refresh the login key and
+        retry once before treating the request as unavailable.
+        """
+
+        last_err: ClientError | OSError | TimeoutError | RuntimeError | None = None
+        refreshed_after_sign_error = False
+
+        for attempt in range(3):
+            try:
+                if self._key is None:
+                    await self.async_ensure_login(f"local_{namespace}")
+
+                message = self._local_request_message(host, namespace, payload)
+                _LOGGER.debug(
+                    "Refoss local request: namespace=%s host=%s attempt=%s payload_keys=%s message_id=%s key_present=%s",
+                    namespace,
+                    host,
+                    attempt + 1,
+                    list(payload.keys()),
+                    message.get("header", {}).get("messageId"),
+                    self._key is not None,
+                )
+                async with self._session.post(
+                    f"http://{host}/public",
+                    json=message,
+                    timeout=LOCAL_API_TIMEOUT,
+                ) as resp:
+                    resp.raise_for_status()
+                    response = await resp.json()
+                header = response.get("header", {})
+                method = header.get("method")
+                payload_data = response.get("payload") or {}
+                error_summary = self._local_error_summary(response)
+                _LOGGER.debug(
+                    "Refoss local response: namespace=%s attempt=%s method=%s payload_keys=%s error=%s",
+                    namespace,
+                    attempt + 1,
+                    method,
+                    list(payload_data.keys()),
+                    error_summary,
+                )
+                if method != "GETACK":
+                    if (
+                        self._is_local_sign_error(response)
+                        and not refreshed_after_sign_error
+                    ):
+                        refreshed_after_sign_error = True
+                        _LOGGER.warning(
+                            "Refoss local %s returned sign error; refreshing cloud key and retrying once: %s",
+                            namespace,
+                            error_summary,
                         )
-                        await asyncio.sleep(2)
+                        await self.async_refresh_login(f"local_sign_error_{namespace}")
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    raise RuntimeError(
+                        f"Refoss local {namespace} returned no GETACK"
+                        + (f": {error_summary}" if error_summary else "")
+                    )
+                return response
+            except (ClientError, OSError, TimeoutError, RuntimeError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "Refoss local request failed: namespace=%s host=%s attempt=%s/3 error=%s",
+                    namespace,
+                    host,
+                    attempt + 1,
+                    err,
+                    exc_info=True,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1)
 
         if last_err is not None:
             raise last_err
-        raise RuntimeError("Refoss MQTT ConsumptionH response failed")
+        raise RuntimeError(f"Refoss local {namespace} request failed")
 
-    async def async_cached_consumption_history(
-        self, channels: list[int], history_refresh_token: str
-    ) -> dict[int, ChannelConsumption]:
-        """Fetch ConsumptionH once per HTTP history refresh bucket."""
+    @staticmethod
+    def _local_error_summary(response: dict[str, Any]) -> str | None:
+        """Return a compact local API error summary for logs."""
 
-        cache_key = (tuple(channels), history_refresh_token)
-        if cache_key in self._consumption_cache:
-            return self._consumption_cache[cache_key]
+        error = (response.get("payload") or {}).get("error")
+        if not isinstance(error, dict):
+            return None
+        code = error.get("code")
+        detail = error.get("detail") or error.get("message")
+        if code is None and detail is None:
+            return None
+        return f"code={code} detail={detail}"
 
-        data = await self.async_current_consumption(channels)
-        self._consumption_cache.clear()
-        self._consumption_cache[cache_key] = data
-        return data
+    @staticmethod
+    def _is_local_sign_error(response: dict[str, Any]) -> bool:
+        """Return true when the local API reports a signature error."""
+
+        error = (response.get("payload") or {}).get("error")
+        if not isinstance(error, dict):
+            return False
+        code = str(error.get("code") or "")
+        detail = str(error.get("detail") or error.get("message") or "").lower()
+        return code == "5001" or "sign" in detail
+
+    def _local_request_message(
+        self, host: str, namespace: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build one local /public request."""
+
+        timestamp = int(time.time())
+        message_id = hashlib.md5(
+            f"{namespace}:{timestamp}:{random.random()}".encode()
+        ).hexdigest()
+        sign_source = f"{message_id}{self._key or ''}{timestamp}"
+        return {
+            "header": {
+                "from": f"http://{host}/config",
+                "messageId": message_id,
+                "method": "GET",
+                "namespace": namespace,
+                "payloadVersion": 1,
+                "sign": hashlib.md5(sign_source.encode()).hexdigest(),
+                "timestamp": timestamp,
+                "triggerSrc": "AndroidLocal",
+                "uuid": self._uuid,
+            },
+            "payload": payload,
+        }
 
     async def _async_electric_history(
         self, channel: int, start_time: int, end_time: int, step: str
     ) -> list[dict[str, Any]]:
-        """Fetch electric history rows for one channel."""
+        """Fetch electric history rows for one channel from the cloud."""
 
         payload = {
             "uuid": self._uuid,
@@ -965,29 +1270,31 @@ class RefossCloudClient:
         if self._token is None:
             await self.async_login()
 
-        # HTTP history is used only for completed daily billing-period rows.
         response = await self._async_post(
             "/historage/v1/deviceTelemetry/query", payload, token=self._token
         )
         if response.get("apiStatus") in (1001, 1002, 5001):
+            _LOGGER.debug(
+                "Refoss token appears expired or invalid during history fetch; logging in again: status=%s",
+                response.get("apiStatus"),
+            )
             await self.async_login()
             response = await self._async_post(
                 "/historage/v1/deviceTelemetry/query", payload, token=self._token
             )
 
         self._raise_for_api_error(response)
-        rows = (
+        return (
             response.get("data", {})
             .get("electricH", {})
             .get("result", {})
             .get("stepSumElectricH", [])
         )
-        return rows
 
     async def async_login(self) -> dict[str, Any]:
-        """Log in and cache the Refoss cloud token."""
+        """Log in and cache the Refoss cloud token for history calls."""
 
-        # The Refoss app sends an MD5 password hash, then returns HTTP/MQTT auth data.
+        _LOGGER.debug("Refoss cloud login started: email=%s uuid=%s", self._email, self._uuid)
         password_md5 = hashlib.md5(self._password.encode("utf8")).hexdigest()
         response = await self._async_post(
             "/v1/Auth/signIn",
@@ -1009,229 +1316,10 @@ class RefossCloudClient:
         self._raise_for_api_error(response)
         data = response["data"]
         self._token = data["token"]
-        self._userid = str(data["userid"])
         self._key = data["key"]
-        self._mqtt_domain = data["mqttDomain"]
         self._api_base = data.get("domain") or self._api_base
+        _LOGGER.debug("Refoss cloud login completed: api_base=%s", self._api_base)
         return data
-
-    def _mqtt_current_electricity(self) -> dict[int, ChannelElectricity]:
-        """Fetch ElectricityX through the Refoss cloud MQTT broker."""
-
-        if self._userid is None or self._key is None or self._mqtt_domain is None:
-            raise RuntimeError("Refoss MQTT credentials are missing")
-
-        app_id = hashlib.md5(_random_string(16).encode()).hexdigest()
-        app_topic = f"/app/{self._userid}-{app_id}/subscribe"
-        client_id = f"app:{app_id}"
-        password = hashlib.md5(f"{self._userid}{self._key}".encode()).hexdigest()
-
-        # Publish a GET request and wait for the matching messageId GETACK.
-        raw_socket = socket.create_connection((self._mqtt_domain, 443), timeout=12)
-        with ssl.create_default_context().wrap_socket(
-            raw_socket, server_hostname=self._mqtt_domain
-        ) as mqtt:
-            mqtt.settimeout(12)
-            connect = (
-                _mqtt_string("MQTT")
-                + bytes([4, 0xC2])
-                + struct.pack("!H", 60)
-                + _mqtt_string(client_id)
-                + _mqtt_string(self._userid)
-                + _mqtt_string(password)
-            )
-            mqtt.sendall(_mqtt_packet(0x10, connect))
-            packet_type, packet = _mqtt_read_packet(mqtt)
-            if packet_type != 0x20 or packet[-1] != 0:
-                raise RuntimeError("Refoss MQTT connection failed")
-
-            # Responses arrive on the app subscribe topic.
-            subscribe = struct.pack("!H", 1) + _mqtt_string(app_topic) + b"\x00"
-            mqtt.sendall(_mqtt_packet(0x82, subscribe))
-            packet_type, packet = _mqtt_read_packet(mqtt)
-            if packet_type != 0x90 or packet[-1] == 0x80:
-                raise RuntimeError("Refoss MQTT subscribe failed")
-
-            message_id = hashlib.md5(app_id.encode()).hexdigest()
-            timestamp = int(time.time())
-            sign = hashlib.md5(
-                f"{message_id}{self._key}{timestamp}".encode()
-            ).hexdigest()
-            # ElectricityX returns all EM06 channel readings in one request.
-            message = {
-                "header": {
-                    "from": app_topic,
-                    "messageId": message_id,
-                    "method": "GET",
-                    "namespace": "Appliance.Control.ElectricityX",
-                    "payloadVersion": 1,
-                    "sign": sign,
-                    "timestamp": timestamp,
-                    "triggerSrc": "HA",
-                    "uuid": self._uuid,
-                },
-                "payload": {"electricity": {"channel": 65535}},
-            }
-            publish_topic = f"/appliance/{self._uuid}/subscribe"
-            mqtt.sendall(
-                _mqtt_packet(
-                    0x30,
-                    _mqtt_string(publish_topic)
-                    + json.dumps(message, separators=(",", ":")).encode(),
-                )
-            )
-
-            deadline = time.monotonic() + 12
-            while time.monotonic() < deadline:
-                packet_type, packet = _mqtt_read_packet(mqtt)
-                if packet_type != 0x30:
-                    continue
-
-                topic_length = struct.unpack("!H", packet[:2])[0]
-                payload = json.loads(packet[2 + topic_length :].decode())
-                if (
-                    payload.get("header", {}).get("messageId") != message_id
-                    or payload.get("header", {}).get("method") != "GETACK"
-                ):
-                    continue
-
-                # Store raw units; entity classes convert them for HA display.
-                rows = payload.get("payload", {}).get("electricity", [])
-                return {
-                    int(row["channel"]): ChannelElectricity(
-                        mconsume_wh=int(row["mConsume"]),
-                        current_ma=int(row.get("current") or 0),
-                        voltage_mv=int(row.get("voltage") or 0),
-                        power_mw=int(row.get("power") or 0),
-                        factor=float(row.get("factor") or 0),
-                    )
-                    for row in rows
-                    if "channel" in row and "mConsume" in row
-                }
-
-            raise RuntimeError("Refoss MQTT ElectricityX response timed out")
-
-    def _mqtt_current_consumption(
-        self, channels: list[int]
-    ) -> dict[int, ChannelConsumption]:
-        """Fetch ConsumptionH through the Refoss cloud MQTT broker."""
-
-        if self._userid is None or self._key is None or self._mqtt_domain is None:
-            raise RuntimeError("Refoss MQTT credentials are missing")
-
-        app_id = hashlib.md5(_random_string(16).encode()).hexdigest()
-        app_topic = f"/app/{self._userid}-{app_id}/subscribe"
-        client_id = f"app:{app_id}"
-        password = hashlib.md5(f"{self._userid}{self._key}".encode()).hexdigest()
-
-        raw_socket = socket.create_connection((self._mqtt_domain, 443), timeout=12)
-        with ssl.create_default_context().wrap_socket(
-            raw_socket, server_hostname=self._mqtt_domain
-        ) as mqtt:
-            mqtt.settimeout(12)
-            connect = (
-                _mqtt_string("MQTT")
-                + bytes([4, 0xC2])
-                + struct.pack("!H", 60)
-                + _mqtt_string(client_id)
-                + _mqtt_string(self._userid)
-                + _mqtt_string(password)
-            )
-            mqtt.sendall(_mqtt_packet(0x10, connect))
-            packet_type, packet = _mqtt_read_packet(mqtt)
-            if packet_type != 0x20 or packet[-1] != 0:
-                raise RuntimeError("Refoss MQTT connection failed")
-
-            subscribe = struct.pack("!H", 1) + _mqtt_string(app_topic) + b"\x00"
-            mqtt.sendall(_mqtt_packet(0x82, subscribe))
-            packet_type, packet = _mqtt_read_packet(mqtt)
-            if packet_type != 0x90 or packet[-1] == 0x80:
-                raise RuntimeError("Refoss MQTT subscribe failed")
-
-            result: dict[int, ChannelConsumption] = {}
-            for channel in channels:
-                message_id = hashlib.md5(f"{app_id}:{channel}".encode()).hexdigest()
-                timestamp = int(time.time())
-                sign = hashlib.md5(
-                    f"{message_id}{self._key}{timestamp}".encode()
-                ).hexdigest()
-                # ConsumptionH backs the app's current-day and hourly energy views.
-                # 65535 does not answer reliably, so query one channel at a time.
-                message = {
-                    "header": {
-                        "from": app_topic,
-                        "messageId": message_id,
-                        "method": "GET",
-                        "namespace": "Appliance.Control.ConsumptionH",
-                        "payloadVersion": 1,
-                        "sign": sign,
-                        "timestamp": timestamp,
-                        "triggerSrc": "HA",
-                        "uuid": self._uuid,
-                    },
-                    "payload": {"consumptionH": [{"channel": channel}]},
-                }
-                publish_topic = f"/appliance/{self._uuid}/subscribe"
-                mqtt.sendall(
-                    _mqtt_packet(
-                        0x30,
-                        _mqtt_string(publish_topic)
-                        + json.dumps(message, separators=(",", ":")).encode(),
-                    )
-                )
-
-                deadline = time.monotonic() + 12
-                while time.monotonic() < deadline:
-                    packet_type, packet = _mqtt_read_packet(mqtt)
-                    if packet_type != 0x30:
-                        continue
-
-                    topic_length = struct.unpack("!H", packet[:2])[0]
-                    payload = json.loads(packet[2 + topic_length :].decode())
-                    if (
-                        payload.get("header", {}).get("messageId") != message_id
-                        or payload.get("header", {}).get("method") != "GETACK"
-                    ):
-                        continue
-
-                    rows = payload.get("payload", {}).get("consumptionH", [])
-                    for row in rows:
-                        if "channel" not in row or "total" not in row:
-                            continue
-                        date_totals_wh: dict[date, int] = {}
-                        date_hour_totals_wh: dict[tuple[date, int], int] = {}
-                        for item in row.get("data") or []:
-                            item_dt = _timestamp_local_datetime(
-                                item.get("timestamp")
-                            )
-                            if item_dt is None:
-                                continue
-                            value = int(item.get("value") or 0)
-                            item_date = item_dt.date()
-                            date_totals_wh[item_date] = (
-                                date_totals_wh.get(item_date, 0) + value
-                            )
-                            hour_key = (item_date, item_dt.hour)
-                            date_hour_totals_wh[hour_key] = (
-                                date_hour_totals_wh.get(hour_key, 0) + value
-                            )
-                        latest_history_date = (
-                            max(date_totals_wh) if date_totals_wh else None
-                        )
-                        result[int(row["channel"])] = ChannelConsumption(
-                            today_wh=int(row["total"]),
-                            history_rows=len(row.get("data") or []),
-                            date_totals_wh=date_totals_wh,
-                            date_hour_totals_wh=date_hour_totals_wh,
-                            latest_history_date=latest_history_date,
-                        )
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Refoss MQTT ConsumptionH response timed out for channel {channel}"
-                    )
-
-            return result
 
     async def async_devices(self) -> list[dict[str, Any]]:
         """Return devices from the Refoss cloud account."""
@@ -1241,11 +1329,15 @@ class RefossCloudClient:
 
         response = await self._async_post("/v1/Device/devList", {}, token=self._token)
         self._raise_for_api_error(response)
-        return response.get("data", [])
+        devices = response.get("data", [])
+        _LOGGER.debug("Refoss cloud devices received: count=%s", len(devices))
+        return devices
 
     async def _async_post(
         self, path: str, params: Any, token: str | None = None
     ) -> dict[str, Any]:
+        """Send one signed Refoss cloud HTTP request."""
+
         encoded_params = base64.b64encode(json.dumps(params).encode("utf8")).decode(
             "utf8"
         )
@@ -1269,9 +1361,9 @@ class RefossCloudClient:
         }
 
         last_err: ClientError | OSError | TimeoutError | None = None
-        max_attempts = 3
-        for attempt in range(max_attempts):
+        for attempt in range(3):
             try:
+                _LOGGER.debug("Refoss HTTP request: path=%s attempt=%s", path, attempt + 1)
                 async with self._session.post(
                     f"{self._api_base}{path}",
                     json={
@@ -1283,17 +1375,25 @@ class RefossCloudClient:
                     headers=headers,
                 ) as resp:
                     resp.raise_for_status()
-                    return await resp.json()
+                    result = await resp.json()
+                _LOGGER.debug(
+                    "Refoss HTTP response: path=%s attempt=%s apiStatus=%s keys=%s",
+                    path,
+                    attempt + 1,
+                    result.get("apiStatus"),
+                    list(result.keys()),
+                )
+                return result
             except (ClientError, OSError, TimeoutError) as err:
                 last_err = err
-                if attempt < max_attempts - 1:
-                    # Match the MQTT retry policy for transient HTTP failures.
-                    _LOGGER.debug(
-                        "Refoss HTTP request failed, retrying attempt %s/%s: %s",
-                        attempt + 2,
-                        max_attempts,
-                        err,
-                    )
+                _LOGGER.debug(
+                    "Refoss HTTP request failed: path=%s attempt=%s/3 error=%s",
+                    path,
+                    attempt + 1,
+                    err,
+                    exc_info=True,
+                )
+                if attempt < 2:
                     await asyncio.sleep(2)
 
         if last_err is not None:
@@ -1302,16 +1402,126 @@ class RefossCloudClient:
 
     @staticmethod
     def _raise_for_api_error(response: dict[str, Any]) -> None:
+        """Raise when a Refoss cloud API response reports an error."""
+
         if response.get("apiStatus") != 0:
             raise RuntimeError(
                 f"Refoss API error {response.get('apiStatus')}: {response.get('info')}"
             )
 
 
-def _row_net_wh(row: dict[str, Any]) -> int:
-    """Return net Wh for one history row."""
+def _parse_electricity_rows(rows: list[dict[str, Any]]) -> dict[int, ChannelElectricity]:
+    """Convert ElectricityX payload rows into channel objects."""
 
-    # value is already net Wh. Solar channels may legitimately be negative.
+    result: dict[int, ChannelElectricity] = {}
+    for row in rows or []:
+        if "channel" not in row:
+            continue
+        try:
+            channel = int(row["channel"])
+        except (TypeError, ValueError):
+            continue
+        result[channel] = ChannelElectricity(
+            mconsume_wh=_safe_int(row.get("mConsume")),
+            current_ma=_safe_int(row.get("current")),
+            voltage_mv=_safe_int(row.get("voltage")),
+            power_mw=_safe_int(row.get("power")),
+            factor=_safe_float(row.get("factor")),
+        )
+    return result
+
+
+def _parse_consumption_rows(rows: list[dict[str, Any]]) -> dict[int, ChannelConsumption]:
+    """Convert ConsumptionH payload rows into channel objects."""
+
+    result: dict[int, ChannelConsumption] = {}
+    for row in rows or []:
+        if "channel" not in row:
+            continue
+        try:
+            channel = int(row["channel"])
+        except (TypeError, ValueError):
+            continue
+        parsed_rows: list[ConsumptionRow] = []
+        skipped = 0
+        for item in row.get("data") or []:
+            item_dt = _timestamp_local_datetime(item.get("timestamp"))
+            timestamp = _normalize_timestamp(item.get("timestamp"))
+            if item_dt is None or timestamp is None:
+                skipped += 1
+                continue
+            parsed_rows.append(
+                ConsumptionRow(
+                    timestamp=timestamp,
+                    local_dt=item_dt,
+                    value_wh=int(item.get("value") or 0),
+                )
+            )
+        parsed_rows.sort(key=lambda item: item.timestamp, reverse=True)
+        result[channel] = ChannelConsumption(
+            raw_total_wh=_safe_int(row.get("total")),
+            rows=parsed_rows,
+        )
+        _LOGGER.debug(
+            "Refoss ConsumptionH parsed: channel=%s rows=%s skipped=%s raw_total_wh=%s",
+            channel,
+            len(parsed_rows),
+            skipped,
+            result[channel].raw_total_wh,
+        )
+    return result
+
+
+def _safe_int(value: Any) -> int | None:
+    """Parse an integer while preserving missing values as None."""
+
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    """Parse a float while preserving missing values as None."""
+
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _consumption_day_sum(consumption: ChannelConsumption, day: date) -> int:
+    """Return the raw ConsumptionH row sum for one local date."""
+
+    return sum(row.value_wh for row in consumption.safe_rows if row.local_dt.date() == day)
+
+
+def _consumption_rows_except_latest(
+    consumption: ChannelConsumption, day: date
+) -> list[ConsumptionRow]:
+    """Return today's rows excluding the latest row only."""
+
+    rows = [row for row in consumption.safe_rows if row.local_dt.date() == day]
+    if not rows:
+        return []
+    latest_timestamp = max(row.timestamp for row in rows)
+    skipped_latest = False
+    result: list[ConsumptionRow] = []
+    for row in rows:
+        if row.timestamp == latest_timestamp and not skipped_latest:
+            skipped_latest = True
+            continue
+        result.append(row)
+    return result
+
+
+def _row_net_wh(row: dict[str, Any]) -> int:
+    """Return net Wh for one cloud history row."""
+
     value = row.get("value")
     if value is not None:
         return int(value)
@@ -1321,142 +1531,130 @@ def _row_net_wh(row: dict[str, Any]) -> int:
     return valcons + valprod
 
 
-def _row_local_date(row: dict[str, Any]) -> date | None:
-    """Return the local date for a cloud history row when available."""
-
-    row_dt = _row_local_datetime(row)
-    if row_dt is not None:
-        return row_dt.date()
-
-    value = row.get("date")
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value[:10])
-        except ValueError:
-            return None
-
-    return None
-
-
 def _row_local_datetime(row: dict[str, Any]) -> datetime | None:
-    """Return the local datetime for a cloud history row when available."""
+    """Return a shifted local datetime for a cloud history row."""
 
     for key in ("timestamp", "time", "ts"):
-        row_dt = _timestamp_local_datetime(row.get(key))
+        row_dt = _timestamp_shifted_local_datetime(
+            row.get(key), shift=-HISTORY_BUCKET_SHIFT
+        )
         if row_dt is not None:
             return row_dt
-
     return None
-
-
-def _timestamp_local_date(value: Any) -> date | None:
-    """Convert a second or millisecond timestamp to a Home Assistant local date."""
-
-    row_dt = _timestamp_local_datetime(value)
-    return row_dt.date() if row_dt is not None else None
 
 
 def _timestamp_local_datetime(value: Any) -> datetime | None:
-    """Convert a second or millisecond timestamp to a Home Assistant local time."""
+    """Convert a timestamp to Home Assistant local time."""
+
+    return _timestamp_shifted_local_datetime(value)
+
+
+def _timestamp_shifted_local_datetime(
+    value: Any, shift: timedelta = timedelta(0)
+) -> datetime | None:
+    """Convert a timestamp to local time and apply an optional shift."""
+
+    timestamp = _normalize_timestamp(value)
+    if timestamp is None:
+        return None
+    return (
+        datetime.fromtimestamp(timestamp, UTC).astimezone(dt_util.DEFAULT_TIME_ZONE)
+        + shift
+    )
+
+
+def _normalize_timestamp(value: Any) -> int | None:
+    """Return a seconds timestamp, accepting millisecond timestamps too."""
 
     if value in (None, ""):
         return None
-
     try:
         timestamp = int(value)
     except (TypeError, ValueError):
         return None
-
     if timestamp > 10_000_000_000:
         timestamp //= 1000
-
-    return datetime.fromtimestamp(timestamp, UTC).astimezone(
-        dt_util.DEFAULT_TIME_ZONE
-    )
+    return timestamp
 
 
-def _local_day_start_timestamp(day: date) -> int:
-    """Return the Unix timestamp for local midnight at the start of a day."""
+def _cloud_history_day_start_timestamp(day: date) -> int:
+    """Return the cloud history start timestamp for one local day."""
 
     return int(
-        datetime(
-            day.year,
-            day.month,
-            day.day,
-            tzinfo=dt_util.DEFAULT_TIME_ZONE,
+        (
+            datetime(day.year, day.month, day.day, tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            + HISTORY_BUCKET_SHIFT
         ).timestamp()
     )
 
 
-def _local_day_end_timestamp(day: date) -> int:
-    """Return the Unix timestamp for the final second of a local day."""
+def _cloud_history_day_end_timestamp(day: date) -> int:
+    """Return the cloud history end timestamp for one local day."""
 
-    return _local_day_start_timestamp(day + timedelta(days=1)) - 1
-
-
-def _random_string(length: int) -> str:
-    """Return a random uppercase string for Refoss message ids."""
-
-    return "".join(
-        random.SystemRandom().choice(string.ascii_uppercase + string.digits)
-        for _ in range(length)
-    )
+    return _cloud_history_day_start_timestamp(day + timedelta(days=1)) - 1
 
 
-def _mqtt_string(value: str) -> bytes:
-    """Encode an MQTT UTF-8 string."""
+def _parse_date(value: Any) -> date | None:
+    """Parse an ISO date string."""
 
-    # MQTT strings are a 2-byte length prefix followed by UTF-8 bytes.
-    encoded = value.encode()
-    return struct.pack("!H", len(encoded)) + encoded
-
-
-def _mqtt_remaining_length(length: int) -> bytes:
-    """Encode an MQTT remaining length field."""
-
-    # MQTT remaining length uses a 7-bit variable-length encoding.
-    result = b""
-    while True:
-        digit = length % 128
-        length //= 128
-        if length:
-            digit |= 128
-        result += bytes([digit])
-        if not length:
-            return result
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
-def _mqtt_packet(packet_type: int, payload: bytes) -> bytes:
-    """Build an MQTT packet."""
+def _find_host_by_uuid_mac(uuid: str) -> str | None:
+    """Try to find the local host by the MAC address embedded in the UUID."""
 
-    return bytes([packet_type]) + _mqtt_remaining_length(len(payload)) + payload
+    compact_mac = uuid[-12:].lower()
+    if len(compact_mac) != 12:
+        return None
+
+    colon_mac = ":".join(compact_mac[index : index + 2] for index in range(0, 12, 2))
+    hyphen_mac = colon_mac.replace(":", "-")
+
+    proc_arp = Path("/proc/net/arp")
+    if proc_arp.exists():
+        try:
+            for line in proc_arp.read_text(encoding="utf-8").splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[3].lower() == colon_mac:
+                    return parts[0]
+        except OSError:
+            pass
+
+    try:
+        result = subprocess.run(
+            ["arp", "-a"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    for line in result.stdout.splitlines():
+        lower = line.lower()
+        if colon_mac in lower or hyphen_mac in lower:
+            for part in line.replace("(", " ").replace(")", " ").split():
+                if _looks_like_ipv4(part):
+                    return part
+    return None
 
 
-def _mqtt_read_packet(mqtt: ssl.SSLSocket) -> tuple[int, bytes]:
-    """Read one MQTT packet."""
+def _looks_like_ipv4(value: str) -> bool:
+    """Return true when a string looks like an IPv4 address."""
 
-    # Keep the dependency surface small by implementing minimal MQTT framing.
-    header = mqtt.recv(1)
-    if not header:
-        raise RuntimeError("Refoss MQTT connection closed")
-
-    multiplier = 1
-    remaining = 0
-    while True:
-        encoded_byte = mqtt.recv(1)[0]
-        remaining += (encoded_byte & 127) * multiplier
-        if not encoded_byte & 128:
-            break
-        multiplier *= 128
-
-    payload = b""
-    while len(payload) < remaining:
-        chunk = mqtt.recv(remaining - len(payload))
-        if not chunk:
-            raise RuntimeError("Refoss MQTT connection closed")
-        payload += chunk
-
-    return header[0], payload
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        return False
 
 
 def _channel_label(channel: int) -> str:
@@ -1465,13 +1663,92 @@ def _channel_label(channel: int) -> str:
     return CHANNEL_LABELS.get(channel, f"C{channel}")
 
 
-class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
-    """Refoss Cloud billing period energy sensor."""
+def _slugify_entity_id_part(value: str) -> str:
+    """Return a Home Assistant object-id-safe slug part."""
+
+    slug = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    return re.sub(r"_+", "_", slug) or "em06"
+
+
+def _refoss_object_id_prefix(name: str) -> str:
+    """Return an object-id prefix that always starts with refoss_."""
+
+    base = _slugify_entity_id_part(name or DEFAULT_NAME)
+    if base == "refoss" or base.startswith("refoss_"):
+        return base
+    return f"refoss_{base}"
+
+
+def _refoss_display_name_prefix(name: str) -> str:
+    """Return a display name prefix that always starts with Refoss."""
+
+    base = (name or DEFAULT_NAME).strip() or DEFAULT_NAME
+    if base.lower().startswith("refoss"):
+        return base
+    return f"Refoss {base}"
+
+
+def _device_info(name: str, uuid: str) -> dict[str, Any]:
+    """Return the shared Home Assistant device_info payload."""
+
+    return {
+        "identifiers": {(DOMAIN, uuid)},
+        "name": name,
+        "manufacturer": "Refoss",
+        "model": "EM06",
+    }
+
+
+class RefossBaseEnergySensor(CoordinatorEntity, SensorEntity):
+    """Common functionality shared by month and today energy sensors."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 3
     _attr_state_class = SensorStateClass.TOTAL
+    _sensor_slug: str
+    _sensor_label: str
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator[dict[int, ChannelData]],
+        name: str,
+        uuid: str,
+        channel: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._channel = channel
+        channel_label = _channel_label(channel)
+        channel_slug = channel_label.lower()
+        display_prefix = _refoss_display_name_prefix(name)
+        self._attr_unique_id = f"{uuid}_{channel_slug}_{self._sensor_slug}"
+        self._attr_name = f"{display_prefix} {channel_label} {self._sensor_label}"
+        self._attr_device_info = _device_info(name, uuid)
+
+        _LOGGER.debug(
+            "Refoss energy sensor naming: channel=%s sensor_slug=%s unique_id=%s name=%s",
+            channel,
+            self._sensor_slug,
+            self._attr_unique_id,
+            self._attr_name,
+        )
+
+    def _current_data(self) -> ChannelData | None:
+        """Return the latest coordinator data for this channel."""
+
+        return (self.coordinator.data or {}).get(self._channel)
+
+    async def async_update(self) -> None:
+        """Update the entity."""
+
+        await self.coordinator.async_request_refresh()
+
+
+class RefossEnergySensor(RefossBaseEnergySensor):
+    """Refoss billing period energy sensor."""
+
+    _sensor_slug = SENSOR_SLUG
+    _sensor_label = SENSOR_LABEL
 
     def __init__(
         self,
@@ -1481,50 +1758,39 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
         channel: int,
         reading_day: int | str,
     ) -> None:
-        super().__init__(coordinator)
-        self._channel = channel
         self._reading_day = _normalize_reading_day(reading_day)
-        self._attr_unique_id = f"{uuid}_{_channel_label(channel).lower()}_{SENSOR_SLUG}"
-        self._attr_name = f"{name} {_channel_label(channel)} {SENSOR_LABEL}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, uuid)},
-            "name": name,
-            "manufacturer": "Refoss",
-            "model": "EM06",
-        }
+        super().__init__(coordinator, name, uuid, channel)
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
 
-        return self.coordinator.last_update_success and self._channel in (
-            self.coordinator.data or {}
-        )
+        data = self._current_data()
+        return data is not None and data.net_wh is not None
 
     @property
     def native_value(self) -> float | None:
         """Return sensor value in kWh."""
 
-        data = (self.coordinator.data or {}).get(self._channel)
-        if data is None:
+        data = self._current_data()
+        if data is None or data.net_wh is None:
             return None
-
-        # Internal energy values are Wh; HA displays kWh.
         return round(data.net_wh / 1000, 3)
 
     @property
     def last_reset(self) -> datetime:
         """Return the start of the current billing period."""
 
-        period = _billing_period(self._reading_day)
+        period = _billing_period(self._reading_day, dt_util.now())
         return datetime.fromtimestamp(period.local_start, dt_util.DEFAULT_TIME_ZONE)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes."""
 
-        period = _billing_period(self._reading_day)
-        data = (self.coordinator.data or {}).get(self._channel)
+        now = dt_util.now()
+        period = _billing_period(self._reading_day, now)
+        data = self._current_data()
         attrs: dict[str, Any] = {
             "channel": self._channel,
             "channel_label": _channel_label(self._channel),
@@ -1541,76 +1807,39 @@ class RefossCloudEnergySensor(CoordinatorEntity, SensorEntity):
 
         attrs.update(
             {
-                "current_mconsume_kwh": round(data.current_mconsume_wh / 1000, 3),
-                "today_snapshot_kwh": (
-                    round(data.today_snapshot_wh / 1000, 3)
-                    if data.today_snapshot_wh is not None
-                    else None
-                ),
-                "completed_history_kwh": round(
-                    data.completed_history_wh / 1000, 3
-                ),
-                "today_snapshot_delta_kwh": round(data.today_wh / 1000, 3),
-                "yesterday_filled_hours": data.yesterday_filled_hours,
-                "yesterday_missing_hours": data.yesterday_missing_hours,
+                "source": data.source,
+                "error": data.error,
+                "current_mconsume_kwh": _kwh_or_none(data.current_mconsume_wh),
+                "completed_history_kwh": _kwh_or_none(data.completed_history_wh),
+                "today_kwh": _kwh_or_none(data.today_wh),
+                "consumptionh_total_kwh": _kwh_or_none(data.raw_total_wh),
+                "ledger_row_count": data.ledger_row_count,
+                "today_row_count": data.today_row_count,
             }
         )
-        return {
-            **attrs,
-        }
-
-    async def async_update(self) -> None:
-        """Update the entity."""
-
-        await self.coordinator.async_request_refresh()
+        return attrs
 
 
-class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
-    """Refoss Cloud current-day energy sensor."""
+class RefossTodayEnergySensor(RefossBaseEnergySensor):
+    """Refoss current-day energy sensor."""
 
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    _attr_suggested_display_precision = 3
-    _attr_state_class = SensorStateClass.TOTAL
-
-    def __init__(
-        self,
-        coordinator: DataUpdateCoordinator[dict[int, ChannelData]],
-        name: str,
-        uuid: str,
-        channel: int,
-    ) -> None:
-        super().__init__(coordinator)
-        self._channel = channel
-        self._attr_unique_id = (
-            f"{uuid}_{_channel_label(channel).lower()}_{TODAY_SENSOR_SLUG}"
-        )
-        self._attr_name = f"{name} {_channel_label(channel)} {TODAY_SENSOR_LABEL}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, uuid)},
-            "name": name,
-            "manufacturer": "Refoss",
-            "model": "EM06",
-        }
+    _sensor_slug = TODAY_SENSOR_SLUG
+    _sensor_label = TODAY_SENSOR_LABEL
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
 
-        return self.coordinator.last_update_success and self._channel in (
-            self.coordinator.data or {}
-        )
+        data = self._current_data()
+        return data is not None and data.today_wh is not None
 
     @property
     def native_value(self) -> float | None:
         """Return today's net energy in kWh."""
 
-        data = (self.coordinator.data or {}).get(self._channel)
-        if data is None:
+        data = self._current_data()
+        if data is None or data.today_wh is None:
             return None
-        if data.today_source != "cloud_mqtt_mconsume_minus_midnight_snapshot":
-            return None
-
         return round(data.today_wh / 1000, 3)
 
     @property
@@ -1624,39 +1853,26 @@ class RefossCloudTodayEnergySensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes."""
 
-        now = dt_util.now()
-        data = (self.coordinator.data or {}).get(self._channel)
+        data = self._current_data()
         attrs: dict[str, Any] = {
             "channel": self._channel,
             "channel_label": _channel_label(self._channel),
-            "date": now.date().isoformat(),
         }
-        if data is None:
-            return attrs
-
-        attrs.update(
-            {
-                "current_mconsume_kwh": round(data.current_mconsume_wh / 1000, 3),
-                "today_snapshot_kwh": (
-                    round(data.today_snapshot_wh / 1000, 3)
-                    if data.today_snapshot_wh is not None
-                    else None
-                ),
-                "today_snapshot_delta_kwh": round(data.today_wh / 1000, 3),
-            }
-        )
+        if data is not None:
+            attrs.update(
+                {
+                    "source": data.source,
+                    "error": data.error,
+                    "today_row_count": data.today_row_count,
+                    "raw_total_kwh": _kwh_or_none(data.raw_total_wh),
+                }
+            )
         return attrs
 
-    async def async_update(self) -> None:
-        """Update the entity."""
 
-        await self.coordinator.async_request_refresh()
+class RefossInstantSensor(CoordinatorEntity, SensorEntity):
+    """Refoss instantaneous electricity sensor."""
 
-
-class RefossCloudInstantSensor(CoordinatorEntity, SensorEntity):
-    """Refoss Cloud instantaneous ElectricityX sensor."""
-
-    _attr_suggested_display_precision = 3
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
@@ -1668,61 +1884,87 @@ class RefossCloudInstantSensor(CoordinatorEntity, SensorEntity):
         sensor_type: str,
     ) -> None:
         super().__init__(coordinator)
-        description = INSTANT_SENSOR_TYPES[sensor_type]
         self._channel = channel
         self._sensor_type = sensor_type
-        self._attr_unique_id = f"{uuid}_{channel}_{sensor_type}"
-        self._attr_name = (
-            f"{name} {_channel_label(channel)} {description['label']}"
+        meta = INSTANT_SENSOR_TYPES[sensor_type]
+        channel_label = _channel_label(channel)
+        channel_slug = channel_label.lower()
+        object_id_prefix = _refoss_object_id_prefix(name)
+        object_id = f"{object_id_prefix}_{channel_slug}_{sensor_type}"
+
+        # Change the instant-sensor unique_id namespace so Home Assistant does
+        # not restore the old registry entry such as sensor.em06_a1_power.
+        # The visible entity_id is also set explicitly for fresh installs.
+        self._attr_unique_id = f"{uuid}_{object_id}"
+        self._attr_suggested_object_id = object_id
+        self.entity_id = f"sensor.{object_id}"
+        self._attr_name = f"{_refoss_display_name_prefix(name)} {channel_label} {meta['label']}"
+        self._attr_device_info = _device_info(name, uuid)
+        self._attr_device_class = meta["device_class"]
+        self._attr_native_unit_of_measurement = meta["unit"]
+        self._attr_suggested_display_precision = meta["precision"]
+
+        _LOGGER.debug(
+            "Refoss instant sensor naming: channel=%s sensor_type=%s unique_id=%s suggested_object_id=%s entity_id=%s name=%s",
+            channel,
+            sensor_type,
+            self._attr_unique_id,
+            self._attr_suggested_object_id,
+            self.entity_id,
+            self._attr_name,
         )
-        self._attr_device_class = description["device_class"]
-        self._attr_native_unit_of_measurement = description["unit"]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, uuid)},
-            "name": name,
-            "manufacturer": "Refoss",
-            "model": "EM06",
-        }
+
+    def _current_data(self) -> ChannelData | None:
+        """Return the latest coordinator data for this channel."""
+
+        return (self.coordinator.data or {}).get(self._channel)
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
 
-        return self.coordinator.last_update_success and self._channel in (
-            self.coordinator.data or {}
-        )
+        return self.native_value is not None
 
     @property
     def native_value(self) -> float | None:
-        """Return instantaneous sensor value."""
+        """Return the instantaneous sensor value."""
 
-        data = (self.coordinator.data or {}).get(self._channel)
+        data = self._current_data()
         if data is None:
             return None
-
-        # Convert raw ElectricityX units to HA display units.
         if self._sensor_type == "power":
-            return round(data.power_mw / 1000, 3)
+            return None if data.power_mw is None else round(data.power_mw / 1000, 1)
         if self._sensor_type == "voltage":
-            return round(data.voltage_mv / 1000, 3)
-        if self._sensor_type == "power_factor":
-            return round(data.factor, 3)
+            return None if data.voltage_mv is None else round(data.voltage_mv / 1000, 1)
         if self._sensor_type == "current":
-            return round(data.current_ma / 1000, 3)
-
+            return None if data.current_ma is None else round(data.current_ma / 1000, 3)
+        if self._sensor_type == "power_factor":
+            return data.factor
         return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes."""
 
-        return {
+        data = self._current_data()
+        attrs: dict[str, Any] = {
             "channel": self._channel,
             "channel_label": _channel_label(self._channel),
-            "source": "cloud_mqtt_electricityx",
+            "sensor_type": self._sensor_type,
         }
+        if data is not None:
+            attrs.update({"source": data.source, "error": data.error})
+        return attrs
 
     async def async_update(self) -> None:
         """Update the entity."""
 
         await self.coordinator.async_request_refresh()
+
+
+def _kwh_or_none(value_wh: int | None) -> float | None:
+    """Convert Wh to kWh while preserving None."""
+
+    if value_wh is None:
+        return None
+    return round(value_wh / 1000, 3)
