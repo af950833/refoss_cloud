@@ -2,7 +2,7 @@
 
 Refoss EM06을 Home Assistant에서 사용하기 위한 비공식 커스텀 통합입니다.
 
-이 통합은 **Refoss 클라우드 HTTP API**와 **EM06 로컬 `/public` API**를 함께 사용해 채널별 전력 정보를 가져옵니다. 현재 구현은 클라우드 MQTT를 사용하지 않습니다.
+이 통합은 **Refoss 클라우드 HTTP API**와 **EM06 로컬 `/public` API**를 함께 사용해 채널별 전력 정보를 가져옵니다.
 
 제공하는 센서는 다음과 같습니다.
 
