@@ -170,19 +170,6 @@ Refoss EM06 A1 Current
 
 코드상 센서는 채널별로 생성됩니다.
 
-```text
-A1 Billing month energy
-A1 This Day Energy
-A1 Power
-A1 Voltage
-A1 PF
-A1 Current
-B1 Billing month energy
-B1 This Day Energy
-...
-```
-
-다만 Home Assistant의 기기 화면에서는 UI 자체의 정렬 규칙에 따라 실제 표시 순서가 코드의 추가 순서와 다르게 보일 수 있습니다.
 
 ## Entity ID
 
