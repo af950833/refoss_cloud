@@ -15,9 +15,10 @@
         "data": {
           "uuid": "Device",
           "name": "Name",
+          "host": "Local device host (optional)",
           "reading_day": "Meter reading day",
           "channels": "Channels (A1/B1/C1/A2/B2/C2)",
-          "scan_interval": "MQTT update interval (seconds)"
+          "scan_interval": "Local API update interval (seconds)"
         }
       }
     },
@@ -34,9 +35,10 @@
     "step": {
       "init": {
         "title": "Refoss Cloud options",
-        "description": "Adjust Refoss Cloud polling settings.",
+        "description": "Adjust Refoss polling settings.",
         "data": {
-          "scan_interval": "MQTT update interval (seconds)"
+          "host": "Local device host (optional)",
+          "scan_interval": "Local API update interval (seconds)"
         }
       }
     }
