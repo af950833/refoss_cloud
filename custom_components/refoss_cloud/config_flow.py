@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import (
     CONF_EMAIL,
+    CONF_HOST,
     CONF_NAME,
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
@@ -25,7 +26,7 @@ from .sensor import (
     DEFAULT_NAME,
     DEFAULT_SCAN_INTERVAL,
     READING_DAY_LAST,
-    RefossCloudClient,
+    RefossClient,
 )
 
 CHANNEL_OPTIONS = [
@@ -65,7 +66,7 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            client = RefossCloudClient(
+            client = RefossClient(
                 session=async_get_clientsession(self.hass),
                 email=user_input[CONF_EMAIL],
                 password=user_input[CONF_PASSWORD],
@@ -123,6 +124,7 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_EMAIL: self._email,
                         CONF_PASSWORD: self._password,
                         CONF_UUID: uuid,
+                        CONF_HOST: (user_input.get(CONF_HOST) or "").strip(),
                         CONF_NAME: title,
                         CONF_READING_DAY: _parse_reading_day(
                             user_input[CONF_READING_DAY]
@@ -142,6 +144,7 @@ class RefossCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_UUID, default=first_uuid): vol.In(device_options),
                     vol.Optional(CONF_NAME, default=first_name or DEFAULT_NAME): str,
+                    vol.Optional(CONF_HOST, default=""): str,
                     vol.Required(
                         CONF_READING_DAY, default="24"
                     ): selector.SelectSelector(
@@ -185,6 +188,7 @@ class RefossCloudOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(
                 title="",
                 data={
+                    CONF_HOST: (user_input.get(CONF_HOST) or "").strip(),
                     CONF_SCAN_INTERVAL: _parse_scan_interval(
                         user_input[CONF_SCAN_INTERVAL]
                     )
@@ -197,10 +201,15 @@ class RefossCloudOptionsFlow(config_entries.OptionsFlow):
                 CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_SECONDS
             ),
         )
+        current_host = self._config_entry.options.get(
+            CONF_HOST,
+            self._config_entry.data.get(CONF_HOST, ""),
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
+                    vol.Optional(CONF_HOST, default=current_host): str,
                     vol.Required(
                         CONF_SCAN_INTERVAL,
                         default=_parse_scan_interval(current),
