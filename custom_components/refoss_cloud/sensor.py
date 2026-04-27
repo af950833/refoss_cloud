@@ -1,9 +1,4 @@
-"""Refoss EM06 energy sensors with safe startup and debug logging.
-
-This version intentionally creates entities even when the local Refoss API has
-missing rows, no GETACK responses, or outage-related gaps.  Missing values are
-reported as unavailable/None instead of aborting Home Assistant platform setup.
-"""
+"""Refoss EM06 Home Assistant sensors using local API, cloud history, and an in-memory ledger."""
 
 from __future__ import annotations
 
@@ -44,7 +39,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
@@ -68,8 +62,7 @@ HISTORY_BUCKET_SHIFT = timedelta(hours=9)
 LOCAL_API_TIMEOUT = 3
 CONSUMPTIONH_BATCH_SIZE = 3
 CONSUMPTIONH_BATCH_DELAY = 0.1
-LEDGER_STORE_VERSION = 1
-LEDGER_SCHEMA_VERSION = 1
+CONSUMPTIONH_UNSTABLE_GAP_SECONDS = 3600
 
 SENSOR_SLUG = "billing_month_energy"
 SENSOR_LABEL = "Billing month energy"
@@ -198,63 +191,17 @@ class BillingPeriod:
 
 
 class HourlyEnergyLedger:
-    """Persistent hourly ledger used for completed billing-period rows."""
+    """In-memory hourly ledger used for completed billing-period rows."""
 
-    def __init__(self, hass: HomeAssistant, uuid: str) -> None:
+    def __init__(self, uuid: str) -> None:
         self._uuid = uuid
-        self._store: Store = Store(
-            hass, LEDGER_STORE_VERSION, f"{DOMAIN}_hourly_ledger_{uuid}"
-        )
-        self._data = self._empty_data()
+        self._rows: dict[int, dict[int, ConsumptionRow]] = {}
 
     @property
-    def storage_key(self) -> str:
-        """Return the Home Assistant storage key."""
+    def ledger_id(self) -> str:
+        """Return a stable in-memory ledger identifier for logs."""
 
-        return f"{DOMAIN}_hourly_ledger_{self._uuid}"
-
-    def _empty_data(self) -> dict[str, Any]:
-        """Return an empty persisted ledger shape."""
-
-        return {
-            "version": LEDGER_SCHEMA_VERSION,
-            "uuid": self._uuid,
-            "rebuilt_at": None,
-            "period_start": None,
-            "updated_at": None,
-            "rows": {},
-        }
-
-    async def async_load(self) -> None:
-        """Load the ledger once during setup."""
-
-        stored = await self._store.async_load()
-        if not isinstance(stored, dict):
-            _LOGGER.debug(
-                "Refoss ledger not found or invalid; creating empty ledger: key=%s",
-                self.storage_key,
-            )
-            self._data = self._empty_data()
-            return
-
-        if stored.get("version") != LEDGER_SCHEMA_VERSION:
-            _LOGGER.warning(
-                "Refoss ledger schema mismatch; resetting ledger: key=%s stored_version=%s expected_version=%s",
-                self.storage_key,
-                stored.get("version"),
-                LEDGER_SCHEMA_VERSION,
-            )
-            self._data = self._empty_data()
-            return
-
-        self._data = stored
-        self._data.setdefault("rows", {})
-        _LOGGER.debug(
-            "Refoss ledger loaded: key=%s channels=%s row_count=%s",
-            self.storage_key,
-            list((self._data.get("rows") or {}).keys()),
-            self.total_row_count(),
-        )
+        return f"{DOMAIN}_in_memory_hourly_ledger_{self._uuid}"
 
     async def async_rebuild(
         self,
@@ -264,19 +211,13 @@ class HourlyEnergyLedger:
         rebuild_now: datetime,
         current_consumption: dict[int, ChannelConsumption],
     ) -> None:
-        """Recreate the ledger for the current billing period, then save it.
-
-        Cloud-history or local-buffer gaps are tolerated.  The file is still
-        saved so that a power-loss recovery never prevents entity creation.
-        """
+        """Recreate the in-memory ledger for the current billing period."""
 
         period = _billing_period(reading_day, rebuild_now)
         period_start = period.start_date
         today = rebuild_now.date()
         yesterday = today - timedelta(days=1)
-        new_data = self._empty_data()
-        new_data["rebuilt_at"] = rebuild_now.isoformat()
-        new_data["period_start"] = period_start.isoformat()
+        rows: dict[int, dict[int, ConsumptionRow]] = {}
 
         _LOGGER.debug(
             "Refoss ledger rebuild started: channels=%s period_start=%s today=%s yesterday=%s",
@@ -301,18 +242,18 @@ class HourlyEnergyLedger:
 
             for channel in channels:
                 accepted = 0
-                for row in history_rows.get(channel, []):
-                    row_dt = _row_local_datetime(row)
+                for history_row in history_rows.get(channel, []):
+                    row_dt = _row_local_datetime(history_row)
                     if row_dt is None or not period_start <= row_dt.date() <= yesterday:
                         continue
-                    self._add_ledger_row(
-                        new_data,
+                    self._add_row(
+                        rows,
                         channel,
-                        timestamp=int(row_dt.timestamp()),
-                        row_date=row_dt.date(),
-                        hour=row_dt.hour,
-                        value_wh=_row_net_wh(row),
-                        source="cloud_http_1h",
+                        ConsumptionRow(
+                            timestamp=int(row_dt.timestamp()),
+                            local_dt=row_dt,
+                            value_wh=_row_net_wh(history_row),
+                        ),
                     )
                     accepted += 1
                 _LOGGER.debug(
@@ -324,27 +265,21 @@ class HourlyEnergyLedger:
             # The most recent completed day can lag in HTTP history. Fill only
             # missing yesterday hours from the local ConsumptionH buffer.
             for channel in channels:
-                present_hours = self._hours_for_day(new_data, channel, yesterday)
+                present_hours = self._hours_for_day(rows, channel, yesterday)
                 consumption = current_consumption.get(channel)
                 if consumption is None:
                     continue
+
                 filled = 0
-                for hour in range(24):
-                    if hour in present_hours:
+                for item in consumption.safe_rows:
+                    if item.local_dt.date() != yesterday:
                         continue
-                    for item in consumption.safe_rows:
-                        if item.local_dt.date() != yesterday or item.local_dt.hour != hour:
-                            continue
-                        self._add_ledger_row(
-                            new_data,
-                            channel,
-                            timestamp=item.timestamp,
-                            row_date=item.local_dt.date(),
-                            hour=item.local_dt.hour,
-                            value_wh=item.value_wh,
-                            source="local_consumptionh_fill",
-                        )
-                        filled += 1
+                    if item.local_dt.hour in present_hours:
+                        continue
+                    self._add_row(rows, channel, item)
+                    present_hours.add(item.local_dt.hour)
+                    filled += 1
+
                 if filled:
                     _LOGGER.debug(
                         "Refoss ledger rebuild filled yesterday rows from local buffer: channel=%s filled=%s",
@@ -352,24 +287,17 @@ class HourlyEnergyLedger:
                         filled,
                     )
 
-        # Keep today's completed rows in the file for restart recovery, but do
-        # not include today rows in completed_history calculations.
+        # Keep today's completed local rows in memory for restart-time rebuilds.
+        # Today rows are still excluded from completed_history calculations.
         for channel in channels:
             consumption = current_consumption.get(channel)
             if consumption is None:
                 continue
-            added_today = 0
-            for item in _consumption_rows_except_latest(consumption, today):
-                self._add_ledger_row(
-                    new_data,
-                    channel,
-                    timestamp=item.timestamp,
-                    row_date=item.local_dt.date(),
-                    hour=item.local_dt.hour,
-                    value_wh=item.value_wh,
-                    source="local_consumptionh_today",
-                )
-                added_today += 1
+            added_today = sum(
+                1
+                for item in _consumption_rows_except_latest(consumption, today)
+                if self._add_row(rows, channel, item)
+            )
             if added_today:
                 _LOGGER.debug(
                     "Refoss ledger rebuild stored today's completed local rows: channel=%s rows=%s",
@@ -377,11 +305,10 @@ class HourlyEnergyLedger:
                     added_today,
                 )
 
-        self._data = new_data
-        await self.async_save()
+        self._rows = rows
         _LOGGER.info(
-            "Refoss ledger rebuild completed: key=%s total_rows=%s",
-            self.storage_key,
+            "Refoss in-memory ledger rebuild completed: ledger_id=%s total_rows=%s",
+            self.ledger_id,
             self.total_row_count(),
         )
 
@@ -396,25 +323,19 @@ class HourlyEnergyLedger:
         changed = False
         for channel in channels:
             consumption = current_consumption.get(channel)
-            if consumption is None or len(consumption.safe_rows) < 2:
-                continue
-            row = sorted(
-                consumption.safe_rows, key=lambda item: item.timestamp, reverse=True
-            )[1]
-            if row.local_dt.date() < period_start:
-                continue
-            if self._has_timestamp(channel, row.timestamp):
-                continue
-            self._add_ledger_row(
-                self._data,
-                channel,
-                timestamp=row.timestamp,
-                row_date=row.local_dt.date(),
-                hour=row.local_dt.hour,
-                value_wh=row.value_wh,
-                source="local_consumptionh_runtime",
+            rows = (
+                sorted(consumption.safe_rows, key=lambda item: item.timestamp, reverse=True)
+                if consumption
+                else []
             )
-            changed = True
+            if len(rows) < 2:
+                continue
+
+            row = rows[1]
+            if row.local_dt.date() < period_start or self._has_timestamp(channel, row.timestamp):
+                continue
+
+            changed = self._add_row(self._rows, channel, row) or changed
             _LOGGER.debug(
                 "Refoss ledger appended runtime row: channel=%s timestamp=%s value_wh=%s",
                 channel,
@@ -423,105 +344,76 @@ class HourlyEnergyLedger:
             )
 
         if changed:
-            self._data["updated_at"] = dt_util.now().isoformat()
-            await self.async_save()
-
-    async def async_save(self) -> None:
-        """Persist the current in-memory ledger."""
-
-        try:
-            await self._store.async_save(self._data)
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("Refoss ledger save failed: key=%s", self.storage_key)
-            raise
-        else:
             _LOGGER.debug(
-                "Refoss ledger saved: key=%s total_rows=%s",
-                self.storage_key,
+                "Refoss in-memory ledger updated: ledger_id=%s total_rows=%s",
+                self.ledger_id,
                 self.total_row_count(),
             )
 
-    def is_empty(self) -> bool:
-        """Return true when no rows are currently loaded."""
-
-        return not any((self._data.get("rows") or {}).values())
-
     def total_row_count(self) -> int:
-        """Return total persisted row count."""
+        """Return total row count."""
 
-        return sum(len(rows or {}) for rows in (self._data.get("rows") or {}).values())
+        return sum(len(rows) for rows in self._rows.values())
 
     def completed_sum_wh(self, channel: int, start: date, end: date) -> int:
         """Return the saved Wh sum between two local dates, inclusive."""
 
         if end < start:
             return 0
-
-        total = 0
-        for row in self._channel_rows(channel).values():
-            row_date = _parse_date(row.get("date"))
-            if row_date is None or not start <= row_date <= end:
-                continue
-            total += int(row.get("value") or 0)
-        return total
+        return sum(
+            row.value_wh
+            for row in self._channel_rows(channel).values()
+            if start <= row.local_dt.date() <= end
+        )
 
     def row_count(self, channel: int, start: date, end: date) -> int:
         """Return the saved row count between two local dates, inclusive."""
 
         if end < start:
             return 0
-        count = 0
-        for row in self._channel_rows(channel).values():
-            row_date = _parse_date(row.get("date"))
-            if row_date is not None and start <= row_date <= end:
-                count += 1
-        return count
+        return sum(
+            1
+            for row in self._channel_rows(channel).values()
+            if start <= row.local_dt.date() <= end
+        )
 
-    def _channel_rows(self, channel: int) -> dict[str, Any]:
+    def _channel_rows(self, channel: int) -> dict[int, ConsumptionRow]:
         """Return the row mapping for one channel."""
 
-        rows = self._data.setdefault("rows", {})
-        return rows.setdefault(str(channel), {})
+        return self._rows.setdefault(channel, {})
 
     def _has_timestamp(self, channel: int, timestamp: int) -> bool:
         """Return true if the row timestamp is already in the ledger."""
 
-        return str(timestamp) in self._channel_rows(channel)
+        return timestamp in self._channel_rows(channel)
 
-    def _add_ledger_row(
+    def _add_row(
         self,
-        data: dict[str, Any],
+        rows: dict[int, dict[int, ConsumptionRow]],
         channel: int,
-        timestamp: int,
-        row_date: date,
-        hour: int,
-        value_wh: int,
-        source: str,
-    ) -> None:
+        row: ConsumptionRow,
+    ) -> bool:
         """Insert one row if its timestamp is not already present."""
 
-        rows = data.setdefault("rows", {})
-        channel_rows = rows.setdefault(str(channel), {})
-        key = str(timestamp)
-        if key in channel_rows:
-            return
-        channel_rows[key] = {
-            "timestamp": timestamp,
-            "date": row_date.isoformat(),
-            "hour": hour,
-            "value": int(value_wh),
-            "source": source,
-        }
+        channel_rows = rows.setdefault(channel, {})
+        if row.timestamp in channel_rows:
+            return False
+        channel_rows[row.timestamp] = row
+        return True
 
-    def _hours_for_day(self, data: dict[str, Any], channel: int, day: date) -> set[int]:
+    def _hours_for_day(
+        self,
+        rows: dict[int, dict[int, ConsumptionRow]],
+        channel: int,
+        day: date,
+    ) -> set[int]:
         """Return saved hour numbers for one date."""
 
-        channel_rows = data.setdefault("rows", {}).setdefault(str(channel), {})
-        hours: set[int] = set()
-        for row in channel_rows.values():
-            if row.get("date") == day.isoformat():
-                hours.add(int(row.get("hour") or 0))
-        return hours
+        return {
+            row.local_dt.hour
+            for row in rows.setdefault(channel, {}).values()
+            if row.local_dt.date() == day
+        }
 
 
 async def async_setup_platform(
@@ -607,17 +499,12 @@ async def _async_setup_sensors(
         _LOGGER.debug("Refoss local host resolved: uuid=%s host=%s", uuid, host)
 
     polling_lock = asyncio.Lock()
-    ledger = HourlyEnergyLedger(hass, uuid)
-    await ledger.async_load()
-
-    # Force the .storage file to be created even when there are no data rows yet.
-    try:
-        await ledger.async_save()
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning(
-            "Refoss empty ledger file could not be saved during setup; continuing so entities can be created",
-            exc_info=True,
-        )
+    ledger = HourlyEnergyLedger(uuid)
+    _LOGGER.debug(
+        "Refoss in-memory ledger initialized: ledger_id=%s total_rows=%s",
+        ledger.ledger_id,
+        ledger.total_row_count(),
+    )
 
     rebuild_now = dt_util.now()
     try:
@@ -627,14 +514,10 @@ async def _async_setup_sensors(
         )
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning(
-            "Refoss ledger bootstrap failed; entities will still be created. Existing/empty ledger will be used: %s",
+            "Refoss in-memory ledger bootstrap failed; entities will still be created with the current empty/partial ledger: %s",
             err,
             exc_info=True,
         )
-        try:
-            await ledger.async_save()
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning("Refoss ledger save after bootstrap failure also failed", exc_info=True)
 
     coordinator: DataUpdateCoordinator[dict[int, ChannelData]]
     coordinator = DataUpdateCoordinator(
@@ -648,6 +531,7 @@ async def _async_setup_sensors(
             channels,
             reading_day,
             polling_lock,
+            lambda: coordinator.data,
         ),
     )
 
@@ -672,15 +556,17 @@ async def _async_setup_sensors(
                 name=name,
                 uuid=uuid,
                 channel=channel,
+                sensor_kind="billing",
                 reading_day=reading_day,
             )
         )
         entities.append(
-            RefossTodayEnergySensor(
+            RefossEnergySensor(
                 coordinator=coordinator,
                 name=name,
                 uuid=uuid,
                 channel=channel,
+                sensor_kind="today",
             )
         )
         for sensor_type in INSTANT_SENSOR_TYPES:
@@ -700,10 +586,10 @@ async def _async_setup_sensors(
     )
     async_add_entities(entities)
     _LOGGER.info(
-        "Refoss sensor setup completed: uuid=%s entities=%s ledger_key=%s ledger_rows=%s",
+        "Refoss sensor setup completed: uuid=%s entities=%s ledger_id=%s ledger_rows=%s",
         uuid,
         len(entities),
-        ledger.storage_key,
+        ledger.ledger_id,
         ledger.total_row_count(),
     )
 
@@ -714,6 +600,7 @@ async def _async_update_data(
     channels: list[int],
     reading_day: int | str,
     polling_lock: asyncio.Lock,
+    previous_data_getter: Any | None = None,
 ) -> dict[int, ChannelData]:
     """Fetch one update for all configured channels."""
 
@@ -722,6 +609,11 @@ async def _async_update_data(
         period = _billing_period(reading_day, now)
         today = now.date()
         yesterday = today - timedelta(days=1)
+        previous_data = (
+            previous_data_getter()
+            if callable(previous_data_getter)
+            else None
+        )
 
         try:
             current_electricity, current_consumption = await client.async_current_snapshot(
@@ -759,12 +651,78 @@ async def _async_update_data(
                 errors.append("ConsumptionH missing")
                 consumption = ChannelConsumption(raw_total_wh=None, rows=[])
 
-            today_wh = _consumption_day_sum(consumption, today)
             completed_wh = ledger.completed_sum_wh(channel, period.start_date, yesterday)
+            ledger_row_count = ledger.row_count(channel, period.start_date, yesterday)
+            unstable_gap, latest_row, previous_row, gap_seconds = (
+                _consumptionh_unstable_latest_gap(consumption)
+            )
+
+            if unstable_gap:
+                previous_channel_data = (previous_data or {}).get(channel)
+                errors.append(
+                    "ConsumptionH unstable latest gap"
+                    + (f" {gap_seconds}s" if gap_seconds is not None else "")
+                )
+                _LOGGER.warning(
+                    "Refoss ConsumptionH energy update ignored due to unstable latest gap: "
+                    "channel=%s latest=%s previous=%s gap_seconds=%s previous_energy_present=%s",
+                    channel,
+                    _format_consumption_row(latest_row),
+                    _format_consumption_row(previous_row),
+                    gap_seconds,
+                    previous_channel_data is not None
+                    and (
+                        previous_channel_data.net_wh is not None
+                        or previous_channel_data.today_wh is not None
+                    ),
+                )
+
+                data[channel] = ChannelData(
+                    net_wh=previous_channel_data.net_wh
+                    if previous_channel_data is not None
+                    else None,
+                    today_wh=previous_channel_data.today_wh
+                    if previous_channel_data is not None
+                    else None,
+                    current_mconsume_wh=electricity.mconsume_wh,
+                    completed_history_wh=completed_wh,
+                    raw_total_wh=previous_channel_data.raw_total_wh
+                    if previous_channel_data is not None
+                    else None,
+                    ledger_row_count=ledger_row_count,
+                    today_row_count=previous_channel_data.today_row_count
+                    if previous_channel_data is not None
+                    else 0,
+                    current_ma=electricity.current_ma,
+                    voltage_mv=electricity.voltage_mv,
+                    power_mw=electricity.power_mw,
+                    factor=electricity.factor,
+                    source="held_previous_energy_unstable_consumptionh_gap"
+                    if previous_channel_data is not None
+                    else "unstable_consumptionh_gap_no_previous_energy",
+                    error="; ".join(errors) if errors else None,
+                )
+
+                _LOGGER.debug(
+                    "Refoss channel update held previous energy: channel=%s net_wh=%s today_wh=%s "
+                    "ledger_rows=%s today_rows=%s mconsume=%s power_mw=%s voltage_mv=%s current_ma=%s error=%s",
+                    channel,
+                    data[channel].net_wh,
+                    data[channel].today_wh,
+                    data[channel].ledger_row_count,
+                    data[channel].today_row_count,
+                    data[channel].current_mconsume_wh,
+                    data[channel].power_mw,
+                    data[channel].voltage_mv,
+                    data[channel].current_ma,
+                    data[channel].error,
+                )
+                continue
+
+            today_wh = _consumption_day_sum(consumption, today)
             today_row_count = sum(
                 1 for row in consumption.safe_rows if row.local_dt.date() == today
             )
-            ledger_row_count = ledger.row_count(channel, period.start_date, yesterday)
 
             # Month/today energy can be calculated only when local ConsumptionH
             # has at least one current-day row or ledger has completed rows.
@@ -1500,6 +1458,40 @@ def _consumption_day_sum(consumption: ChannelConsumption, day: date) -> int:
     return sum(row.value_wh for row in consumption.safe_rows if row.local_dt.date() == day)
 
 
+def _consumptionh_unstable_latest_gap(
+    consumption: ChannelConsumption,
+) -> tuple[bool, ConsumptionRow | None, ConsumptionRow | None, int | None]:
+    """Return true when latest and previous ConsumptionH rows are too far apart.
+
+    Around the hourly rollover the EM06 can temporarily return a new latest row
+    without the expected completed row.  When the newest row and the second
+    newest row are one hour or more apart, do not use this poll for energy
+    totals; keep the previous energy values and wait for the next poll.
+    """
+
+    rows = sorted(consumption.safe_rows, key=lambda item: item.timestamp, reverse=True)
+    if len(rows) < 2:
+        return False, rows[0] if rows else None, None, None
+
+    latest = rows[0]
+    previous = rows[1]
+    gap_seconds = latest.timestamp - previous.timestamp
+    return (
+        gap_seconds >= CONSUMPTIONH_UNSTABLE_GAP_SECONDS,
+        latest,
+        previous,
+        gap_seconds,
+    )
+
+
+def _format_consumption_row(row: ConsumptionRow | None) -> str | None:
+    """Return a compact ConsumptionH row string for logs."""
+
+    if row is None:
+        return None
+    return f"{row.local_dt:%Y-%m-%d %H:%M:%S}|ts={row.timestamp}|wh={row.value_wh}"
+
+
 def _consumption_rows_except_latest(
     consumption: ChannelConsumption, day: date
 ) -> list[ConsumptionRow]:
@@ -1593,16 +1585,6 @@ def _cloud_history_day_end_timestamp(day: date) -> int:
 
     return _cloud_history_day_start_timestamp(day + timedelta(days=1)) - 1
 
-
-def _parse_date(value: Any) -> date | None:
-    """Parse an ISO date string."""
-
-    if not isinstance(value, str):
-        return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        return None
 
 
 def _find_host_by_uuid_mac(uuid: str) -> str | None:
@@ -1699,15 +1681,13 @@ def _device_info(name: str, uuid: str) -> dict[str, Any]:
     }
 
 
-class RefossBaseEnergySensor(CoordinatorEntity, SensorEntity):
-    """Common functionality shared by month and today energy sensors."""
+class RefossEnergySensor(CoordinatorEntity, SensorEntity):
+    """Refoss billing-period or current-day energy sensor."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 3
     _attr_state_class = SensorStateClass.TOTAL
-    _sensor_slug: str
-    _sensor_label: str
 
     def __init__(
         self,
@@ -1715,20 +1695,26 @@ class RefossBaseEnergySensor(CoordinatorEntity, SensorEntity):
         name: str,
         uuid: str,
         channel: int,
+        sensor_kind: str,
+        reading_day: int | str | None = None,
     ) -> None:
         super().__init__(coordinator)
         self._channel = channel
+        self._is_today = sensor_kind == "today"
+        self._reading_day = _normalize_reading_day(reading_day or 1)
+        sensor_slug = TODAY_SENSOR_SLUG if self._is_today else SENSOR_SLUG
+        sensor_label = TODAY_SENSOR_LABEL if self._is_today else SENSOR_LABEL
         channel_label = _channel_label(channel)
         channel_slug = channel_label.lower()
-        display_prefix = _refoss_display_name_prefix(name)
-        self._attr_unique_id = f"{uuid}_{channel_slug}_{self._sensor_slug}"
-        self._attr_name = f"{display_prefix} {channel_label} {self._sensor_label}"
+
+        self._attr_unique_id = f"{uuid}_{channel_slug}_{sensor_slug}"
+        self._attr_name = f"{_refoss_display_name_prefix(name)} {channel_label} {sensor_label}"
         self._attr_device_info = _device_info(name, uuid)
 
         _LOGGER.debug(
             "Refoss energy sensor naming: channel=%s sensor_slug=%s unique_id=%s name=%s",
             channel,
-            self._sensor_slug,
+            sensor_slug,
             self._attr_unique_id,
             self._attr_name,
         )
@@ -1738,75 +1724,67 @@ class RefossBaseEnergySensor(CoordinatorEntity, SensorEntity):
 
         return (self.coordinator.data or {}).get(self._channel)
 
-    async def async_update(self) -> None:
-        """Update the entity."""
-
-        await self.coordinator.async_request_refresh()
-
-
-class RefossEnergySensor(RefossBaseEnergySensor):
-    """Refoss billing period energy sensor."""
-
-    _sensor_slug = SENSOR_SLUG
-    _sensor_label = SENSOR_LABEL
-
-    def __init__(
-        self,
-        coordinator: DataUpdateCoordinator[dict[int, ChannelData]],
-        name: str,
-        uuid: str,
-        channel: int,
-        reading_day: int | str,
-    ) -> None:
-        self._reading_day = _normalize_reading_day(reading_day)
-        super().__init__(coordinator, name, uuid, channel)
-
     @property
     def available(self) -> bool:
         """Return if entity is available."""
 
         data = self._current_data()
-        return data is not None and data.net_wh is not None
+        value = data.today_wh if self._is_today and data else data.net_wh if data else None
+        return value is not None
 
     @property
     def native_value(self) -> float | None:
-        """Return sensor value in kWh."""
+        """Return energy sensor value in kWh."""
 
         data = self._current_data()
-        if data is None or data.net_wh is None:
+        if data is None:
             return None
-        return round(data.net_wh / 1000, 3)
+        value = data.today_wh if self._is_today else data.net_wh
+        return _kwh_or_none(value)
 
     @property
     def last_reset(self) -> datetime:
-        """Return the start of the current billing period."""
+        """Return the reset point for this total sensor."""
 
-        period = _billing_period(self._reading_day, dt_util.now())
+        now = dt_util.now()
+        if self._is_today:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period = _billing_period(self._reading_day, now)
         return datetime.fromtimestamp(period.local_start, dt_util.DEFAULT_TIME_ZONE)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes."""
 
-        now = dt_util.now()
-        period = _billing_period(self._reading_day, now)
         data = self._current_data()
         attrs: dict[str, Any] = {
             "channel": self._channel,
             "channel_label": _channel_label(self._channel),
-            "reading_day": self._reading_day,
-            "period_start": datetime.fromtimestamp(
-                period.local_start, dt_util.DEFAULT_TIME_ZONE
-            ).isoformat(),
-            "period_end": datetime.fromtimestamp(
-                period.end, dt_util.DEFAULT_TIME_ZONE
-            ).isoformat(),
         }
         if data is None:
             return attrs
 
+        if self._is_today:
+            attrs.update(
+                {
+                    "source": data.source,
+                    "error": data.error,
+                    "today_row_count": data.today_row_count,
+                    "raw_total_kwh": _kwh_or_none(data.raw_total_wh),
+                }
+            )
+            return attrs
+
+        period = _billing_period(self._reading_day, dt_util.now())
         attrs.update(
             {
+                "reading_day": self._reading_day,
+                "period_start": datetime.fromtimestamp(
+                    period.local_start, dt_util.DEFAULT_TIME_ZONE
+                ).isoformat(),
+                "period_end": datetime.fromtimestamp(
+                    period.end, dt_util.DEFAULT_TIME_ZONE
+                ).isoformat(),
                 "source": data.source,
                 "error": data.error,
                 "current_mconsume_kwh": _kwh_or_none(data.current_mconsume_wh),
@@ -1819,55 +1797,10 @@ class RefossEnergySensor(RefossBaseEnergySensor):
         )
         return attrs
 
+    async def async_update(self) -> None:
+        """Update the entity."""
 
-class RefossTodayEnergySensor(RefossBaseEnergySensor):
-    """Refoss current-day energy sensor."""
-
-    _sensor_slug = TODAY_SENSOR_SLUG
-    _sensor_label = TODAY_SENSOR_LABEL
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-
-        data = self._current_data()
-        return data is not None and data.today_wh is not None
-
-    @property
-    def native_value(self) -> float | None:
-        """Return today's net energy in kWh."""
-
-        data = self._current_data()
-        if data is None or data.today_wh is None:
-            return None
-        return round(data.today_wh / 1000, 3)
-
-    @property
-    def last_reset(self) -> datetime:
-        """Return local midnight for the current day."""
-
-        now = dt_util.now()
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra attributes."""
-
-        data = self._current_data()
-        attrs: dict[str, Any] = {
-            "channel": self._channel,
-            "channel_label": _channel_label(self._channel),
-        }
-        if data is not None:
-            attrs.update(
-                {
-                    "source": data.source,
-                    "error": data.error,
-                    "today_row_count": data.today_row_count,
-                    "raw_total_kwh": _kwh_or_none(data.raw_total_wh),
-                }
-            )
-        return attrs
+        await self.coordinator.async_request_refresh()
 
 
 class RefossInstantSensor(CoordinatorEntity, SensorEntity):
@@ -1939,7 +1872,7 @@ class RefossInstantSensor(CoordinatorEntity, SensorEntity):
         if self._sensor_type == "current":
             return None if data.current_ma is None else round(data.current_ma / 1000, 3)
         if self._sensor_type == "power_factor":
-            return data.factor
+            return None if data.factor is None else round(data.factor, 3)
         return None
 
     @property
