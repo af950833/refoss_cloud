@@ -36,7 +36,7 @@ CHANNEL_OPTIONS = [
 
 READING_DAY_OPTIONS = [
     {"value": str(day), "label": str(day)} for day in range(1, 28)
-] + [{"value": READING_DAY_LAST, "label": "Last day"}]
+] + [{"value": READING_DAY_LAST, "label": "말일"}]
 DEFAULT_SCAN_INTERVAL_SECONDS = int(DEFAULT_SCAN_INTERVAL.total_seconds())
 
 
