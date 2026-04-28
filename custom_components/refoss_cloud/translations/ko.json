@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Refoss Cloud 계정 연결",
+        "description": "Refoss 계정 이메일과 비밀번호를 입력합니다. 로그인 후 계정에 등록된 EM06 장치를 선택합니다.",
+        "data": {
+          "email": "이메일",
+          "password": "비밀번호"
+        }
+      },
+      "device": {
+        "title": "Refoss EM06 장치 설정",
+        "description": "사용할 EM06 장치, 로컬 장치 주소, 검침일, 채널, 갱신 주기를 설정합니다. 로컬 장치 주소를 비워 두면 UUID의 MAC 정보를 기준으로 자동 탐색을 시도합니다.",
+        "data": {
+          "uuid": "장치",
+          "name": "이름",
+          "host": "로컬 장치 주소(선택)",
+          "reading_day": "검침일",
+          "channels": "사용 채널(A1/B1/C1/A2/B2/C2)",
+          "scan_interval": "로컬 API 갱신 주기(초)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Refoss Cloud에 연결하거나 로그인할 수 없습니다. 계정 정보와 네트워크 상태를 확인하세요.",
+      "invalid_channels": "EM06 채널을 하나 이상 선택하세요."
+    },
+    "abort": {
+      "already_configured": "이 Refoss 장치는 이미 설정되어 있습니다.",
+      "no_devices": "이 계정에서 Refoss 장치를 찾을 수 없습니다."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Refoss Cloud 옵션",
+        "description": "로컬 장치 주소와 갱신 주기를 조정합니다. 로컬 장치 주소가 비어 있으면 자동 탐색을 사용합니다.",
+        "data": {
+          "host": "로컬 장치 주소(선택)",
+          "scan_interval": "로컬 API 갱신 주기(초)"
+        }
+      }
+    }
+  }
+}
