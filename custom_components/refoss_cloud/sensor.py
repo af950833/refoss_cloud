@@ -36,6 +36,7 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -62,7 +63,9 @@ HISTORY_BUCKET_SHIFT = timedelta(hours=9)
 LOCAL_API_TIMEOUT = 3
 CONSUMPTIONH_BATCH_SIZE = 3
 CONSUMPTIONH_BATCH_DELAY = 0.1
-CONSUMPTIONH_UNSTABLE_GAP_SECONDS = 3600
+CONSUMPTIONH_RETRY_ATTEMPTS = 2
+CONSUMPTIONH_RETRY_DELAY = 1
+CONSUMPTIONH_UNSTABLE_GAP_SECONDS = 3597
 
 SENSOR_SLUG = "billing_month_energy"
 SENSOR_LABEL = "Billing month energy"
@@ -537,15 +540,12 @@ async def _async_setup_sensors(
 
     try:
         await coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady:
+        raise
     except Exception as err:  # noqa: BLE001
-        # This should be rare because _async_update_data also returns safe empty
-        # data.  Keep it as a final guard so entity creation never aborts.
-        _LOGGER.warning(
-            "Refoss first refresh failed; creating entities with unavailable state: %s",
-            err,
-            exc_info=True,
-        )
-        coordinator.data = _empty_channel_data(channels, f"first_refresh_failed: {err}")
+        raise ConfigEntryNotReady(
+            f"Refoss first refresh failed for {uuid}: {err}"
+        ) from err
 
     entities: list[SensorEntity] = []
     for channel in channels:
@@ -582,7 +582,7 @@ async def _async_setup_sensors(
 
     _LOGGER.debug(
         "Refoss entity creation order: %s",
-        [getattr(entity, "_attr_name", None) for entity in entities],
+        [getattr(entity, "_attr_unique_id", None) for entity in entities],
     )
     async_add_entities(entities)
     _LOGGER.info(
@@ -649,7 +649,31 @@ async def _async_update_data(
                 electricity = ChannelElectricity()
             if consumption is None:
                 errors.append("ConsumptionH missing")
-                consumption = ChannelConsumption(raw_total_wh=None, rows=[])
+                completed_wh = ledger.completed_sum_wh(channel, period.start_date, yesterday)
+                ledger_row_count = ledger.row_count(channel, period.start_date, yesterday)
+                previous_channel_data = (previous_data or {}).get(channel)
+                has_previous_energy = previous_channel_data is not None and (
+                    previous_channel_data.net_wh is not None
+                    or previous_channel_data.today_wh is not None
+                )
+                _LOGGER.warning(
+                    "Refoss ConsumptionH missing after retries; holding previous energy: "
+                    "channel=%s previous_energy_present=%s ledger_rows=%s",
+                    channel,
+                    has_previous_energy,
+                    ledger_row_count,
+                )
+                data[channel] = _held_previous_energy_data(
+                    electricity,
+                    previous_channel_data,
+                    completed_wh,
+                    ledger_row_count,
+                    errors,
+                    has_previous_energy,
+                    "held_previous_energy_consumptionh_missing",
+                    "consumptionh_missing_no_previous_energy",
+                )
+                continue
 
             completed_wh = ledger.completed_sum_wh(channel, period.start_date, yesterday)
             ledger_row_count = ledger.row_count(channel, period.start_date, yesterday)
@@ -677,30 +701,15 @@ async def _async_update_data(
                     ),
                 )
 
-                data[channel] = ChannelData(
-                    net_wh=previous_channel_data.net_wh
-                    if previous_channel_data is not None
-                    else None,
-                    today_wh=previous_channel_data.today_wh
-                    if previous_channel_data is not None
-                    else None,
-                    current_mconsume_wh=electricity.mconsume_wh,
-                    completed_history_wh=completed_wh,
-                    raw_total_wh=previous_channel_data.raw_total_wh
-                    if previous_channel_data is not None
-                    else None,
-                    ledger_row_count=ledger_row_count,
-                    today_row_count=previous_channel_data.today_row_count
-                    if previous_channel_data is not None
-                    else 0,
-                    current_ma=electricity.current_ma,
-                    voltage_mv=electricity.voltage_mv,
-                    power_mw=electricity.power_mw,
-                    factor=electricity.factor,
-                    source="held_previous_energy_unstable_consumptionh_gap"
-                    if previous_channel_data is not None
-                    else "unstable_consumptionh_gap_no_previous_energy",
-                    error="; ".join(errors) if errors else None,
+                data[channel] = _held_previous_energy_data(
+                    electricity,
+                    previous_channel_data,
+                    completed_wh,
+                    ledger_row_count,
+                    errors,
+                    previous_channel_data is not None,
+                    "held_previous_energy_unstable_consumptionh_gap",
+                    "unstable_consumptionh_gap_no_previous_energy",
                 )
 
                 _LOGGER.debug(
@@ -799,6 +808,35 @@ def _empty_channel_data(channels: list[int], error: str) -> dict[int, ChannelDat
     return {
         channel: ChannelData(source="unavailable", error=error) for channel in channels
     }
+
+
+def _held_previous_energy_data(
+    electricity: ChannelElectricity,
+    previous: ChannelData | None,
+    completed_wh: int,
+    ledger_row_count: int,
+    errors: list[str],
+    source_condition: bool,
+    source_when_held: str,
+    source_when_missing: str,
+) -> ChannelData:
+    """Return current instant values while holding prior energy totals."""
+
+    return ChannelData(
+        net_wh=previous.net_wh if previous is not None else None,
+        today_wh=previous.today_wh if previous is not None else None,
+        current_mconsume_wh=electricity.mconsume_wh,
+        completed_history_wh=completed_wh,
+        raw_total_wh=previous.raw_total_wh if previous is not None else None,
+        ledger_row_count=ledger_row_count,
+        today_row_count=previous.today_row_count if previous is not None else 0,
+        current_ma=electricity.current_ma,
+        voltage_mv=electricity.voltage_mv,
+        power_mw=electricity.power_mw,
+        factor=electricity.factor,
+        source=source_when_held if source_condition else source_when_missing,
+        error="; ".join(errors) if errors else None,
+    )
 
 
 def _billing_period(
@@ -977,11 +1015,7 @@ class RefossClient:
                 channel_batch,
             )
             tasks = [
-                self._async_local_get(
-                    host,
-                    "Appliance.Control.ConsumptionH",
-                    {"consumptionH": [{"channel": channel}]},
-                )
+                self._async_local_consumptionh_channel(host, channel)
                 for channel in channel_batch
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -994,12 +1028,10 @@ class RefossClient:
                         exc_info=response,
                     )
                     continue
-                parsed = _parse_consumption_rows(
-                    response.get("payload", {}).get("consumptionH", [])
-                )
+                parsed = response
                 if channel not in parsed:
                     _LOGGER.warning(
-                        "Refoss local ConsumptionH returned no parsable data for channel %s",
+                        "Refoss local ConsumptionH missing after retries for channel %s",
                         channel,
                     )
                 consumption.update(parsed)
@@ -1026,6 +1058,58 @@ class RefossClient:
             sorted(consumption),
         )
         return electricity, consumption
+
+    async def _async_local_consumptionh_channel(
+        self, host: str, channel: int
+    ) -> dict[int, ChannelConsumption]:
+        """Fetch one channel's ConsumptionH, retrying transient missing data."""
+
+        last_error: Exception | None = None
+        for attempt in range(CONSUMPTIONH_RETRY_ATTEMPTS + 1):
+            if attempt:
+                await asyncio.sleep(CONSUMPTIONH_RETRY_DELAY)
+
+            try:
+                response = await self._async_local_get(
+                    host,
+                    "Appliance.Control.ConsumptionH",
+                    {"consumptionH": [{"channel": channel}]},
+                )
+            except Exception as err:  # noqa: BLE001
+                last_error = err
+                _LOGGER.warning(
+                    "Refoss local ConsumptionH request failed for channel %s attempt %s/%s: %s",
+                    channel,
+                    attempt + 1,
+                    CONSUMPTIONH_RETRY_ATTEMPTS + 1,
+                    err,
+                    exc_info=err,
+                )
+                continue
+
+            parsed = _parse_consumption_rows(
+                response.get("payload", {}).get("consumptionH", [])
+            )
+            if channel in parsed:
+                if attempt:
+                    _LOGGER.debug(
+                        "Refoss local ConsumptionH retry succeeded for channel %s attempt %s/%s",
+                        channel,
+                        attempt + 1,
+                        CONSUMPTIONH_RETRY_ATTEMPTS + 1,
+                    )
+                return parsed
+
+            _LOGGER.warning(
+                "Refoss local ConsumptionH returned no parsable data for channel %s attempt %s/%s",
+                channel,
+                attempt + 1,
+                CONSUMPTIONH_RETRY_ATTEMPTS + 1,
+            )
+
+        if last_error is not None:
+            raise last_error
+        return {}
 
     async def async_electric_history_1h_batch(
         self, channels: list[int], start_day: date, end_day: date
@@ -1675,7 +1759,7 @@ def _device_info(name: str, uuid: str) -> dict[str, Any]:
 
     return {
         "identifiers": {(DOMAIN, uuid)},
-        "name": name,
+        "name": _refoss_display_name_prefix(name),
         "manufacturer": "Refoss",
         "model": "EM06",
     }
@@ -1685,6 +1769,7 @@ class RefossEnergySensor(CoordinatorEntity, SensorEntity):
     """Refoss billing-period or current-day energy sensor."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_has_entity_name = True
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 3
     _attr_state_class = SensorStateClass.TOTAL
@@ -1708,15 +1793,16 @@ class RefossEnergySensor(CoordinatorEntity, SensorEntity):
         channel_slug = channel_label.lower()
 
         self._attr_unique_id = f"{uuid}_{channel_slug}_{sensor_slug}"
-        self._attr_name = f"{_refoss_display_name_prefix(name)} {channel_label} {sensor_label}"
+        self._attr_translation_key = sensor_slug
+        self._attr_translation_placeholders = {"channel": channel_label}
         self._attr_device_info = _device_info(name, uuid)
 
         _LOGGER.debug(
-            "Refoss energy sensor naming: channel=%s sensor_slug=%s unique_id=%s name=%s",
+            "Refoss energy sensor naming: channel=%s sensor_slug=%s unique_id=%s label=%s",
             channel,
             sensor_slug,
             self._attr_unique_id,
-            self._attr_name,
+            sensor_label,
         )
 
     def _current_data(self) -> ChannelData | None:
@@ -1806,6 +1892,7 @@ class RefossEnergySensor(CoordinatorEntity, SensorEntity):
 class RefossInstantSensor(CoordinatorEntity, SensorEntity):
     """Refoss instantaneous electricity sensor."""
 
+    _attr_has_entity_name = True
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
@@ -1831,20 +1918,21 @@ class RefossInstantSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = f"{uuid}_{object_id}"
         self._attr_suggested_object_id = object_id
         self.entity_id = f"sensor.{object_id}"
-        self._attr_name = f"{_refoss_display_name_prefix(name)} {channel_label} {meta['label']}"
+        self._attr_translation_key = sensor_type
+        self._attr_translation_placeholders = {"channel": channel_label}
         self._attr_device_info = _device_info(name, uuid)
         self._attr_device_class = meta["device_class"]
         self._attr_native_unit_of_measurement = meta["unit"]
         self._attr_suggested_display_precision = meta["precision"]
 
         _LOGGER.debug(
-            "Refoss instant sensor naming: channel=%s sensor_type=%s unique_id=%s suggested_object_id=%s entity_id=%s name=%s",
+            "Refoss instant sensor naming: channel=%s sensor_type=%s unique_id=%s suggested_object_id=%s entity_id=%s label=%s",
             channel,
             sensor_type,
             self._attr_unique_id,
             self._attr_suggested_object_id,
             self.entity_id,
-            self._attr_name,
+            meta["label"],
         )
 
     def _current_data(self) -> ChannelData | None:
