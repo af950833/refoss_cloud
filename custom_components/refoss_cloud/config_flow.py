@@ -14,8 +14,8 @@ from homeassistant.const import (
     CONF_PASSWORD,
     CONF_SCAN_INTERVAL,
 )
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import selector
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import DOMAIN
 from .sensor import (
@@ -191,7 +191,7 @@ class RefossCloudOptionsFlow(config_entries.OptionsFlow):
                     CONF_HOST: (user_input.get(CONF_HOST) or "").strip(),
                     CONF_SCAN_INTERVAL: _parse_scan_interval(
                         user_input[CONF_SCAN_INTERVAL]
-                    )
+                    ),
                 },
             )
 
