@@ -4,7 +4,8 @@
   "codeowners": [],
   "config_flow": true,
   "documentation": "https://github.com/af950833/refoss_cloud",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
   "requirements": [],
-  "version": "1.8.2"
+  "version": "1.8.3"
 }
