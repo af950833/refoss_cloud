@@ -42,5 +42,27 @@
         }
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "billing_month_energy": {
+        "name": "{channel} Billing month energy"
+      },
+      "this_day_energy": {
+        "name": "{channel} This day energy"
+      },
+      "power": {
+        "name": "{channel} Power"
+      },
+      "voltage": {
+        "name": "{channel} Voltage"
+      },
+      "power_factor": {
+        "name": "{channel} Power factor"
+      },
+      "current": {
+        "name": "{channel} Current"
+      }
+    }
   }
 }
