@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Refoss Cloud 계정 연결",
-        "description": "Refoss 계정 이메일과 비밀번호를 입력합니다. 로그인 후 계정에 등록된 EM06 장치를 선택합니다.",
+        "description": "Refoss 계정 정보를 입력하세요.",
         "data": {
           "email": "이메일",
           "password": "비밀번호"
@@ -11,7 +11,7 @@
       },
       "device": {
         "title": "Refoss EM06 장치 설정",
-        "description": "사용할 EM06 장치, 로컬 장치 주소, 검침일, 채널, 갱신 주기를 설정합니다. 로컬 장치 주소를 비워 두면 UUID의 MAC 정보를 기준으로 자동 탐색을 시도합니다.",
+        "description": "사용할 EM06 장치, 검침일, 채널, 갱신 주기를 설정합니다.",
         "data": {
           "uuid": "장치",
           "name": "이름",
@@ -23,7 +23,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Refoss Cloud에 연결하거나 로그인할 수 없습니다. 계정 정보와 네트워크 상태를 확인하세요.",
+      "cannot_connect": "Refoss Cloud에 연결하거나 로그인할 수 없습니다.",
       "invalid_channels": "EM06 채널을 하나 이상 선택하세요."
     },
     "abort": {
@@ -35,11 +35,33 @@
     "step": {
       "init": {
         "title": "Refoss Cloud 옵션",
-        "description": "로컬 장치 주소와 갱신 주기를 조정합니다. 로컬 장치 주소가 비어 있으면 자동 탐색을 사용합니다.",
+        "description": "로컬 장치 주소와 갱신 주기를 조정합니다.",
         "data": {
           "host": "로컬 장치 주소(선택)",
           "scan_interval": "로컬 API 갱신 주기(초)"
         }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "billing_month_energy": {
+        "name": "{channel} 검침월 에너지"
+      },
+      "this_day_energy": {
+        "name": "{channel} 오늘 에너지"
+      },
+      "power": {
+        "name": "{channel} 전력"
+      },
+      "voltage": {
+        "name": "{channel} 전압"
+      },
+      "power_factor": {
+        "name": "{channel} 역률"
+      },
+      "current": {
+        "name": "{channel} 전류"
       }
     }
   }
